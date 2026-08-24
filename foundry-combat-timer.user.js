@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Foundry VTT Combat Timer
 // @namespace    https://local.private/
-// @version      0.1
+// @version      0.2
 // @author       DerJJ/Umek
 // @description  Persistent, segmented combat time tracking with a session ring buffer (current + last 2), automatic new session on combat start, dummy data button, scene controls toggle, Player/GM/Team/Setup categorization, player/GM colors, owner-based grouping, defeated filter, two self-roll chat reports (dnd5e & pf2e)
 // @match        https://YOUR-SERVER-1.example.com/*
@@ -364,26 +364,67 @@
     }
 
     // ---- Dummy data (only if the current session is empty) ----
-    function generateDummySegments() {
-      const players = [
+
+    // Standard normal via Box-Muller, then rescaled to (mean, stdDev).
+    function gaussianRandom(mean, stdDev) {
+      let u = 0, v = 0;
+      while (u === 0) u = Math.random(); // avoid log(0)
+      while (v === 0) v = Math.random();
+      const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+      return mean + z * stdDev;
+    }
+
+    // Gaussian duration within [minMs, maxMs]: mean at the range's center,
+    // stdDev = range/6 so ~99.7% of draws land inside on their own; clamped
+    // at the edges to catch the rare outlier from the Box-Muller tail.
+    function randomGaussianDurationMs(minMs, maxMs) {
+      const mean = (minMs + maxMs) / 2;
+      const stdDev = (maxMs - minMs) / 6;
+      const val = gaussianRandom(mean, stdDev);
+      return Math.round(Math.min(maxMs, Math.max(minMs, val)));
+    }
+    const randomTurnDurationMs = () => randomGaussianDurationMs(30_000, 210_000);
+    const randomPauseDurationMs = () => randomGaussianDurationMs(30_000, 60_000);
+
+    // Real players (and their real Foundry colors) if the world actually has
+    // a GM plus at least 3 players configured - otherwise nobody to draw
+    // from, so fall back to fixed placeholder names/colors. When real data
+    // is used, ALL non-GM users are included (not capped at 3).
+    function getDummyPlayerSource() {
+      const realPlayers = game.users.filter((u) => !u.isGM);
+      const gmExists = game.users.some((u) => u.isGM);
+      if (gmExists && realPlayers.length >= 3) {
+        return realPlayers.map((u) => ({ name: u.name, ownerId: u.id, color: getCombatantColor(u.id) }));
+      }
+      return [
         { name: "Aria", ownerId: "dummy-p1", color: "#5865f2" },
         { name: "Boro", ownerId: "dummy-p2", color: "#43b581" },
         { name: "Cass", ownerId: "dummy-p3", color: "#faa61a" },
       ];
+    }
+
+    function generateDummySegments() {
+      const players = getDummyPlayerSource();
       const gmColor = getCombatantColor(null);
       const monsters = [
         { name: "Goblin A", color: gmColor },
         { name: "Goblin B", color: gmColor },
         { name: "Ogre", color: gmColor },
       ];
-      const order = [players[0], monsters[0], players[1], monsters[1], players[2], monsters[2]];
+      // Round-robin interleave - works for any player count, not just 3.
+      const order = [];
+      const maxLen = Math.max(players.length, monsters.length);
+      for (let i = 0; i < maxLen; i++) {
+        if (players[i]) order.push(players[i]);
+        if (monsters[i]) order.push(monsters[i]);
+      }
 
       const out = [];
       let t = Date.now() - 15 * 60 * 1000;
       for (let round = 0; round < 3; round++) {
         for (const entry of order) {
           const isPC = !!entry.ownerId;
-          const dur = Math.round(6000 + Math.random() * 22000);
+          const dur = randomTurnDurationMs();
           out.push({
             id: uid(), start: t, end: t + dur, trigger: "turn",
             combatantId: `dummy-${entry.name}`, combatantName: entry.name,
@@ -393,7 +434,7 @@
           });
           t += dur;
           if (Math.random() < 0.25) {
-            const pauseDur = Math.round(4000 + Math.random() * 9000);
+            const pauseDur = randomPauseDurationMs();
             out.push({
               id: uid(), start: t, end: t + pauseDur, trigger: "pause",
               combatantId: `dummy-${entry.name}`, combatantName: entry.name,
