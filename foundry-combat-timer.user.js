@@ -619,9 +619,9 @@
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((e) => {
           const avgTurn = e.turnCount ? Math.round(e.totalMs / e.turnCount / 1000) : 0;
+          const turnCountTag = e.turnCount ? ` (${e.turnCount}×)` : "";
           const g = gaps.get(e.id);
-          const turnsLabel = e.turnCount ? `${e.turnCount} turn${e.turnCount !== 1 ? "s" : ""}` : "";
-          const avgGap = g && g.count ? `${formatDuration(Math.round(g.avgMs / 1000))} (${turnsLabel})` : "–";
+          const avgGap = g && g.count ? formatDuration(Math.round(g.avgMs / 1000)) : "–";
           const waitMs = waits.get(e.id) ?? 0;
           return `
             <div style="margin:8px 0;">
@@ -630,7 +630,7 @@
                 <span style="color:#eee !important;">${e.name}</span>
               </div>
               <div style="display:flex; justify-content:space-between; gap:8px; font-size:10px; opacity:0.8; margin-top:2px; padding-left:14px; color:#eee !important;">
-                <span style="color:#eee !important;">Turn: ${formatDuration(avgTurn)}</span>
+                <span style="color:#eee !important;">Turn: ${formatDuration(avgTurn)}${turnCountTag}</span>
                 <span style="color:#eee !important;">Gap: ${avgGap}</span>
                 <span style="color:#eee !important;">Wait: ${formatDuration(Math.round(waitMs / 1000))}</span>
               </div>
