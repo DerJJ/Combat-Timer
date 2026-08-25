@@ -54,7 +54,7 @@ currentSegment: Segment|null // current session, the running one
 sessionHistory: { segments: Segment[], endedAt: number }[]  // ring buffer, max 2, newest first
 ```
 
-Persisted as one JSON blob under `localStorage["ctp-state-<world.id>"]`. **Scope is per-browser, per-Foundry-world.** There is no sync between different users' copies of this script — a GM and each player all have entirely independent tracking state. The only cross-client communication is the static HTML snapshot posted via chat reports; nothing feeds back from chat into tracking.
+Persisted as one JSON blob under `localStorage["ctp-state-<world.id>-<user.id>"]`. **Scope is per-browser, per-Foundry-world, per-Foundry-user.** The user-id component exists specifically so two different Foundry accounts logged in from the same physical browser (e.g. a GM previewing a player account in a second tab) don't collide on the same storage key — Foundry only prevents two concurrent logins as the *same* account, not two different ones from one browser. There is no sync between different users' copies of this script — a GM and each player all have entirely independent tracking state. The only cross-client communication is the static HTML snapshot posted via chat reports; nothing feeds back from chat into tracking.
 
 `selectedSession` (`"current" | "prev1" | "prev2"`) is pure UI state controlling what `getSelectedSessionData()` / `allSegments()` return for display and chat-report purposes. It never affects what's actually being tracked live — that always follows `game.combat` / `game.paused` regardless of what's on screen.
 

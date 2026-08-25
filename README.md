@@ -65,5 +65,5 @@ Starting a new combat encounter automatically archives the previous session and 
 
 ## Notes and limitations
 
-- This is entirely **client-side**. It never writes anything to the Foundry server or world — everything lives in your own browser's local storage, scoped per Foundry world. If you want your own copy of the tracker, each person installs the script themselves; it doesn't sync between players or the GM.
+- This is entirely **client-side**. It never writes anything to the Foundry server or world — everything lives in your own browser's local storage, scoped per Foundry world and per Foundry account. If you want your own copy of the tracker, each person installs the script themselves; it doesn't sync between players or the GM.
 - Chat reports use fixed, self-contained styling and don't depend on anyone else having this script installed — they'll look the same for everyone who sees them, in light or dark Foundry theme.

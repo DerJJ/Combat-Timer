@@ -47,7 +47,7 @@
 
     // ---- Persistence ----
     function storageKey() {
-      return `ctp-state-${game.world?.id ?? "default"}`;
+      return `ctp-state-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
     function loadPersisted() {
       try {
