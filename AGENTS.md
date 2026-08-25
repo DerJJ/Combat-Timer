@@ -116,7 +116,7 @@ Four categories: `player`, `dm`, `team`, `setup`.
 
 ## Chat output
 
-`buildBarsContent()` and `buildPlayerListContent()` each return a standalone HTML string (see hard constraint #2 for the styling rules). Both are posted via `postToChat(content, kind)`:
+`buildBarsContent()` and `buildPlayerListContent()` each return a standalone HTML string (see hard constraint #2 for the styling rules), built via a shared `wrapCard({ title, subtitle, body })` — the card container, header line, and "No data" fallback are written once, so the `!important` hardening only has to be kept correct in one place. Both are posted via `postToChat(content, kind)`:
 ```js
 ChatMessage.create({
   content,

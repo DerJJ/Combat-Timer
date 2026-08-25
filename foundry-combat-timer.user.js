@@ -592,6 +592,21 @@
     }
 
     // ---- Chat reports (always self-roll, i.e. whisper to yourself) ----
+    // Shared card chrome (see hard constraint #2) - the single place the
+    // inline-!important styling has to be kept correct, instead of two.
+    function wrapCard({ title, subtitle, body }) {
+      return `
+        <div style="font-family:Signika,sans-serif; font-size:13px; color:#eee !important;
+             background:linear-gradient(160deg,#2a2a35,#1b1b22) !important; border:1px solid #45414f !important;
+             border-radius:8px; padding:10px 12px;">
+          <div style="font-weight:700; letter-spacing:0.3px; margin-bottom:6px; color:#eee !important; display:flex; justify-content:space-between; align-items:baseline;">
+            <span>${title}</span>
+            <span style="opacity:0.7; font-weight:400; font-size:11px;">${subtitle}</span>
+          </div>
+          ${body || `<div style="opacity:0.6; color:#eee !important;">No data</div>`}
+        </div>`;
+    }
+
     function buildBarsContent() {
       const playerEntries = perCombatantStats().map((e) => ({ ...e, icon: "🧑" }));
       const gm = gmTotalStats();
@@ -626,16 +641,11 @@
           </div>`;
       }).join("");
 
-      return `
-        <div style="font-family:Signika,sans-serif; font-size:13px; color:#eee !important;
-             background:linear-gradient(160deg,#2a2a35,#1b1b22) !important; border:1px solid #45414f !important;
-             border-radius:8px; padding:10px 12px;">
-          <div style="font-weight:700; letter-spacing:0.3px; margin-bottom:6px; color:#eee !important; display:flex; justify-content:space-between; align-items:baseline;">
-            <span>⚔️ Combat Times</span>
-            <span style="opacity:0.7; font-weight:400; font-size:11px;">Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}</span>
-          </div>
-          ${bars || `<div style="opacity:0.6; color:#eee !important;">No data</div>`}
-        </div>`;
+      return wrapCard({
+        title: "⚔️ Combat Times",
+        subtitle: `Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}`,
+        body: bars,
+      });
     }
 
     function buildPlayerListContent() {
@@ -663,16 +673,11 @@
             </div>`;
         }).join("");
 
-      return `
-        <div style="font-family:Signika,sans-serif; font-size:13px; color:#eee !important;
-             background:linear-gradient(160deg,#2a2a35,#1b1b22) !important; border:1px solid #45414f !important;
-             border-radius:8px; padding:10px 12px;">
-          <div style="font-weight:700; letter-spacing:0.3px; margin-bottom:2px; color:#eee !important; display:flex; justify-content:space-between; align-items:baseline;">
-            <span>🧑 Player Overview</span>
-            <span style="opacity:0.7; font-weight:400; font-size:11px;">Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}</span>
-          </div>
-          ${rows || `<div style="opacity:0.6; color:#eee !important; margin-top:6px;">No data</div>`}
-        </div>`;
+      return wrapCard({
+        title: "🧑 Player Overview",
+        subtitle: `Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}`,
+        body: rows,
+      });
     }
 
     // Acts on whichever session is CURRENTLY DISPLAYED. For "current" this
