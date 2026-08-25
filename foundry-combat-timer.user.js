@@ -277,7 +277,7 @@
       const getOwner = (id) => {
         if (!map.has(id)) {
           map.set(id, {
-            id, name: game.users.get(id)?.name ?? "?", isPC: true, color: getCombatantColor(id),
+            id, name: game.users.get(id)?.name ?? "?", color: getCombatantColor(id),
             totalMs: 0, turnCount: 0, inTurnMs: 0, outOfTurnMs: 0, byEntity: new Map(),
           });
         }
@@ -566,7 +566,7 @@
 
     // ---- Chat reports (always self-roll, i.e. whisper to yourself) ----
     function buildBarsContent() {
-      const playerEntries = perCombatantStats().filter((e) => e.isPC).map((e) => ({ ...e, icon: "🧑" }));
+      const playerEntries = perCombatantStats().map((e) => ({ ...e, icon: "🧑" }));
       const gm = gmTotalStats();
       const cat = categoryTotals();
       const entries = [...playerEntries];
@@ -615,7 +615,6 @@
       const gaps = betweenTurnStats();
       const waits = absoluteWaitStats();
       const rows = perCombatantStats()
-        .filter((e) => e.isPC)
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((e) => {
           const avgTurn = e.turnCount ? Math.round(e.totalMs / e.turnCount / 1000) : 0;
@@ -963,7 +962,7 @@
           return `<div style="display:flex; align-items:center; gap:6px; padding:2px 0;">
             <span style="width:8px; height:8px; border-radius:50%; background:${e.color}; flex-shrink:0;"></span>
             <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-              ${e.isPC ? "🧑" : "👹"} ${e.name}
+              🧑 ${e.name}
             </span>
             <span style="opacity:0.85; font-size:11px;">${formatDuration(s)}${avg}</span>
           </div>`;
