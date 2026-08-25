@@ -257,27 +257,66 @@
       return allSegments().find((s) => s.id === id) ?? null;
     }
 
+    // Single source of truth for "does this segment count at all" and "who
+    // does its time belong to" - used by every aggregate below (see AGENTS.md).
+    function isTracked(seg) {
+      return !seg.defeated && !!seg.combatantId;
+    }
+    function resolvedOwner(seg) {
+      return seg.overrideOwnerId ?? seg.ownerId ?? null;
+    }
+
+    // One player's turn/entity-time breakdown. "In-turn" = time during a slot
+    // this owner was structurally designated for (their own turn, or one of
+    // their controlled entities' turns - e.g. a necromancer's summons).
+    // "Out-of-turn" = time reassigned to them from someone else's slot (e.g.
+    // an Attack of Opportunity). turnCount/byEntity only count designated
+    // slots, never out-of-turn credit, so reassignment can't inflate them.
     function perCombatantStats() {
       const map = new Map();
-      for (const seg of allSegments()) {
-        if (seg.category !== "player" || !seg.combatantId || seg.defeated) continue;
-        const ownerId = seg.overrideOwnerId ?? seg.ownerId; // explicit override always wins
-        if (!ownerId) continue; // unclaimed NPC turn -> counted in gmTotalStats instead
-        if (!map.has(ownerId)) {
-          const name = game.users.get(ownerId)?.name ?? seg.combatantName;
-          map.set(ownerId, { id: ownerId, name, isPC: true, color: getCombatantColor(ownerId), totalMs: 0, turnCount: 0 });
+      const getOwner = (id) => {
+        if (!map.has(id)) {
+          map.set(id, {
+            id, name: game.users.get(id)?.name ?? "?", isPC: true, color: getCombatantColor(id),
+            totalMs: 0, turnCount: 0, inTurnMs: 0, outOfTurnMs: 0, byEntity: new Map(),
+          });
         }
-        const e = map.get(ownerId);
-        e.totalMs += segMs(seg);
-        if (seg.trigger === "turn" || seg.trigger === "resume") e.turnCount += 1;
+        return map.get(id);
+      };
+      const getEntity = (owner, combatantId, name) => {
+        if (!owner.byEntity.has(combatantId)) owner.byEntity.set(combatantId, { combatantId, name, inTurnMs: 0, turnCount: 0 });
+        return owner.byEntity.get(combatantId);
+      };
+
+      for (const slot of buildTurnSlots()) {
+        const opening = slot.segments[0];
+        if (slot.designatedOwner && opening.category === "player" && isTracked(opening)) {
+          const owner = getOwner(slot.designatedOwner);
+          owner.turnCount += 1;
+          getEntity(owner, opening.combatantId, opening.combatantName).turnCount += 1;
+        }
+        for (const seg of slot.segments) {
+          if (seg.category !== "player" || !isTracked(seg)) continue;
+          const owner = resolvedOwner(seg);
+          if (!owner) continue; // unclaimed NPC turn -> npcAggregate/gmTotalStats instead
+          const e = getOwner(owner);
+          const ms = segMs(seg);
+          e.totalMs += ms;
+          if (owner === slot.designatedOwner) {
+            e.inTurnMs += ms;
+            getEntity(e, seg.combatantId, seg.combatantName).inTurnMs += ms;
+          } else {
+            e.outOfTurnMs += ms;
+          }
+        }
       }
-      return [...map.values()];
+      return [...map.values()].map((e) => ({ ...e, byEntity: [...e.byEntity.values()] }));
     }
 
     function npcAggregate() {
       let totalMs = 0, turns = 0;
       for (const seg of allSegments()) {
-        if (seg.category !== "player" || seg.isPC || !seg.combatantId || seg.defeated) continue;
+        if (seg.category !== "player" || seg.isPC || !isTracked(seg) || seg.overrideOwnerId) continue;
         totalMs += segMs(seg);
         if (seg.trigger === "turn" || seg.trigger === "resume") turns += 1;
       }
@@ -298,34 +337,44 @@
       return Math.round(ms / 1000);
     }
 
-    function buildRuns() {
-      const runs = [];
+    // Partitions the whole timeline into turn slots, independent of who ends
+    // up owning any individual segment inside one. A slot starts at every
+    // "turn"/"resume" segment (a genuine new turn beginning) and absorbs
+    // every following segment - pause/unpause/split, or a reassigned chunk -
+    // until the next one. The very first segment always opens slot 1;
+    // trailing segments after the last trigger stay in the last slot.
+    // designatedOwner is the TECHNICAL (non-overridden) owner of whoever's
+    // turn this structurally was - it never changes due to reassignment.
+    function isTurnStart(seg) {
+      return seg.trigger === "turn" || seg.trigger === "resume";
+    }
+    function buildTurnSlots() {
+      const slots = [];
       for (const seg of allSegments()) {
-        const key = seg.ownerId ?? seg.combatantId;
-        const last = runs[runs.length - 1];
-        const isNewTurn = seg.trigger === "turn" || seg.trigger === "resume";
-        if (last && !isNewTurn && last.key === key) {
-          last.end = seg.end ?? Date.now();
+        if (!slots.length || isTurnStart(seg)) {
+          slots.push({ designatedOwner: seg.ownerId ?? null, start: seg.start, end: seg.end ?? Date.now(), segments: [seg] });
         } else {
-          runs.push({ key, start: seg.start, end: seg.end ?? Date.now() });
+          const slot = slots[slots.length - 1];
+          slot.end = seg.end ?? Date.now();
+          slot.segments.push(seg);
         }
       }
-      return runs;
+      return slots;
     }
 
     function betweenTurnStats() {
-      const byCombatant = new Map();
-      for (const r of buildRuns()) {
-        if (!r.key) continue;
-        if (!byCombatant.has(r.key)) byCombatant.set(r.key, []);
-        byCombatant.get(r.key).push(r);
+      const slots = buildTurnSlots();
+      const byOwner = new Map();
+      for (const s of slots) {
+        if (!s.designatedOwner) continue;
+        if (!byOwner.has(s.designatedOwner)) byOwner.set(s.designatedOwner, []);
+        byOwner.get(s.designatedOwner).push(s);
       }
-      const allRuns = [...byCombatant.values()].flat();
-      const spanStart = allRuns.length ? Math.min(...allRuns.map((r) => r.start)) : 0;
-      const spanEnd = allRuns.length ? Math.max(...allRuns.map((r) => r.end)) : 0;
+      const spanStart = slots.length ? Math.min(...slots.map((s) => s.start)) : 0;
+      const spanEnd = slots.length ? Math.max(...slots.map((s) => s.end)) : 0;
 
       const result = new Map();
-      for (const [id, list] of byCombatant) {
+      for (const [id, list] of byOwner) {
         list.sort((a, b) => a.start - b.start);
         let sum = 0, count = 0;
         for (let i = 0; i < list.length - 1; i++) {
@@ -339,15 +388,31 @@
       return result;
     }
 
+    // Wait = session span minus a player's own active time (in-turn +
+    // out-of-turn combined - both mean "not idle"). "setup" segments are
+    // excluded from active time but stay inside the span, so they read as
+    // wait time for every player. "team" segments are cut out of the span
+    // itself, so shared/group time is invisible to individual wait entirely
+    // (it only shows up via the GM/Team category totals).
     function absoluteWaitStats() {
-      const runs = buildRuns().filter((r) => r.key);
-      if (!runs.length) return new Map();
-      const spanStart = Math.min(...runs.map((r) => r.start));
-      const spanEnd = Math.max(...runs.map((r) => r.end));
-      const span = spanEnd - spanStart;
+      let spanStart = null, spanEnd = null, teamMs = 0;
+      for (const seg of allSegments()) {
+        if (!isTracked(seg)) continue;
+        const end = seg.end ?? Date.now();
+        if (spanStart === null || seg.start < spanStart) spanStart = seg.start;
+        if (spanEnd === null || end > spanEnd) spanEnd = end;
+        if (seg.category === "team") teamMs += segMs(seg);
+      }
+      if (spanStart === null) return new Map();
+      const span = Math.max(0, (spanEnd - spanStart) - teamMs);
 
       const activeMs = new Map();
-      for (const r of runs) activeMs.set(r.key, (activeMs.get(r.key) ?? 0) + (r.end - r.start));
+      for (const seg of allSegments()) {
+        if (seg.category !== "player" || !isTracked(seg)) continue;
+        const owner = resolvedOwner(seg);
+        if (!owner) continue;
+        activeMs.set(owner, (activeMs.get(owner) ?? 0) + segMs(seg));
+      }
       const result = new Map();
       for (const [id, active] of activeMs) result.set(id, Math.max(0, span - active));
       return result;
@@ -469,7 +534,7 @@
     function gmTotalStats() {
       let ms = 0, turns = 0;
       for (const seg of allSegments()) {
-        if (seg.defeated || !seg.combatantId) continue;
+        if (!isTracked(seg)) continue;
         const unclaimedNpcTurn = seg.category === "player" && !seg.isPC && !seg.overrideOwnerId;
         const countsForGM = unclaimedNpcTurn || seg.category === "dm";
         if (!countsForGM) continue;
