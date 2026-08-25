@@ -40,9 +40,7 @@ The atomic unit of tracking — one contiguous slice of time with a single techn
   actorId: string | null,       // Actor document id - stable across the encounter (and across sessions), unlike combatantId; not consumed anywhere yet
   ownerId: string | null,       // Foundry User id of the owning player; null = true NPC/monster
   overrideOwnerId: string | null, // manual reassignment target; wins over ownerId when set
-  isPC: boolean,                 // ownerId !== null (i.e. "player-controlled", not literally actor.type)
   defeated: boolean,              // combatant.isDefeated, snapshotted at segment creation
-  color: string,                  // hex CSS color from getCombatantColor()
   category: "player" | "dm" | "team" | "setup",
 }
 ```
@@ -66,7 +64,7 @@ Persisted as one JSON blob (`{ v: 1, segments, currentSegment, sessionHistory }`
 - `Hooks.on("combatStart" | "updateCombat" [turn/round changed])` → `switchTurn(combat)`
 - `Hooks.on("pauseGame")` → pause/unpause, but only if `game.combat` currently exists (pausing outside combat is not tracked)
 - Script (re)load → `reconcileWithLiveState()`: compares whatever was persisted against the actual live Foundry state (active combatant id + pause state). If it matches, the persisted `currentSegment` is left running untouched (including its original `start` time). If not, it's closed out and a fresh segment opened with trigger `"resume"`.
-- Manual split (✂️ button) → `splitCurrentSegment()`: closes the running segment and opens a new one with trigger `"split"`, carrying over the same technical identity and category (`combatId`/`combatantId`/`actorId`/`ownerId`/`isPC`/`defeated`/`color`/`category`) — a split is a continuation, not a reclassification, so it does not run back through `defaultCategory()`.
+- Manual split (✂️ button) → `splitCurrentSegment()`: closes the running segment and opens a new one with trigger `"split"`, carrying over the same technical identity and category (`combatId`/`combatantId`/`actorId`/`ownerId`/`defeated`/`category`) — a split is a continuation, not a reclassification, so it does not run back through `defaultCategory()`.
 - Manual category/player reassignment: mutates an existing segment's `category`/`overrideOwnerId` in place (no new segment created).
 
 Only triggers `"turn"` and `"resume"` mark a genuinely new turn boundary (see `isTurnStart()` in Timing statistics) — never `"pause"`, `"unpause"`, or `"split"`, since those are continuations of an already-counted turn rather than new ones. `"resume"` counts because, by construction, `reconcileWithLiveState()` only ever creates one when live state does *not* match what was persisted — meaning it always represents either a genuinely new turn discovered after a reload, or a turn change missed while reloading. Either way it hasn't been counted anywhere else.
@@ -91,8 +89,9 @@ Four categories: `player`, `dm`, `team`, `setup`.
 - **Default on creation** (`defaultCategory(trigger, prevSegment)`): `"player"` for every trigger except `"pause"`. For `"pause"`: if the segment right before it lasted under 5 seconds (likely a pause right at a round boundary, before anyone actually started deciding anything), default to `"setup"`; otherwise carry over the previous segment's category (assume genuine mid-decision interruption).
 - **`isTracked(seg)`**: `!seg.defeated && !!seg.combatantId` — the single gate every aggregate uses for "does this segment count at all". An instantly-skipped already-dead combatant, or a segment with no combat context, never drags down any average.
 - **`resolvedOwner(seg)`**: `seg.overrideOwnerId ?? seg.ownerId ?? null` — the single source of truth for "who does this segment's time belong to". An explicit reassignment via the player picker always wins over the technical owner.
+- **`isPlayerControlled(seg)`**: `resolvedOwner(seg) !== null` — derived, not stored. There is no persisted `isPC` field; it used to be frozen at segment creation (`ownerId !== null`) and went stale the moment a segment was reassigned via `overrideOwnerId`, which was the root cause of B-04. Old persisted data may still have an `isPC` field on disk — it's simply ignored on load, no migration needed since it was always derivable.
 - **`perCombatantStats()`**: only `category === "player"` segments, grouped by `resolvedOwner()`. Segments with no resolvable owner (a true, unclaimed NPC turn) are skipped here — they belong to `gmTotalStats()`/`npcAggregate()` instead. Splits each owner's time into `inTurnMs` (time during a turn slot they were structurally designated for — see Timing statistics) and `outOfTurnMs` (time reassigned to them from someone else's slot, e.g. an Attack of Opportunity); `byEntity` further breaks `inTurnMs` down per `combatantId`, so a player controlling multiple combatants (character + summons) can eventually be shown per-entity instead of only merged into one number.
-- **`npcAggregate()`** / **`gmTotalStats()`**: unclaimed NPC-turn segments (`category === "player" && !isPC && !overrideOwnerId`) plus, for `gmTotalStats()`, anything explicitly recategorized to `"dm"`. Both use `isTracked()` and explicitly exclude any segment with `overrideOwnerId` set, so a reassigned NPC turn is never double-counted against both the GM/NPC bucket and the receiving player.
+- **`npcAggregate()`** / **`gmTotalStats()`**: unclaimed NPC-turn segments (`category === "player" && !isPlayerControlled(seg)`) plus, for `gmTotalStats()`, anything explicitly recategorized to `"dm"`. Both use `isTracked()`; `isPlayerControlled()` already accounts for `overrideOwnerId`, so a reassigned NPC turn is never double-counted against both the GM/NPC bucket and the receiving player.
 - **`categoryTotals()`**: raw per-category sums for `dm`/`team`/`setup`, independent of any specific person.
 
 ## Timing statistics

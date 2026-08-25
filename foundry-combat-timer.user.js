@@ -145,9 +145,7 @@
         actorId: combatant?.actor?.id ?? null, // stable across the encounter (and across sessions), unlike combatantId
         ownerId,
         overrideOwnerId: null, // manual reassignment to a specific player, wins over ownerId
-        isPC: ownerId !== null,
         defeated: combatant?.isDefeated ?? false,
-        color: getCombatantColor(ownerId),
         category: defaultCategory(trigger, prev),
       };
     }
@@ -166,9 +164,7 @@
         combatantName: currentSegment.combatantName,
         actorId: currentSegment.actorId,
         ownerId: currentSegment.ownerId,
-        isPC: currentSegment.isPC,
         defeated: currentSegment.defeated,
-        color: currentSegment.color,
         category: currentSegment.category, // a split keeps the same category, not defaultCategory()'s guess
       };
       closeSegment();
@@ -292,6 +288,9 @@
     function resolvedOwner(seg) {
       return seg.overrideOwnerId ?? seg.ownerId ?? null;
     }
+    function isPlayerControlled(seg) {
+      return resolvedOwner(seg) !== null;
+    }
 
     // One player's turn/entity-time breakdown. "In-turn" = time during a slot
     // this owner was structurally designated for (their own turn, or one of
@@ -343,7 +342,7 @@
     function npcAggregate() {
       let totalMs = 0, turns = 0;
       for (const seg of allSegments()) {
-        if (seg.category !== "player" || seg.isPC || !isTracked(seg) || seg.overrideOwnerId) continue;
+        if (seg.category !== "player" || isPlayerControlled(seg) || !isTracked(seg)) continue;
         totalMs += segMs(seg);
         if (seg.trigger === "turn" || seg.trigger === "resume") turns += 1;
       }
@@ -478,30 +477,30 @@
     const randomTurnDurationMs = () => randomGaussianDurationMs(30_000, 210_000);
     const randomPauseDurationMs = () => randomGaussianDurationMs(30_000, 60_000);
 
-    // Real players (and their real Foundry colors) if the world actually has
-    // a GM plus at least 3 players configured - otherwise nobody to draw
-    // from, so fall back to fixed placeholder names/colors. When real data
-    // is used, ALL non-GM users are included (not capped at 3).
+    // Real players if the world actually has a GM plus at least 3 players
+    // configured - otherwise nobody to draw from, so fall back to fixed
+    // placeholder names. When real data is used, ALL non-GM users are
+    // included (not capped at 3). Colors are always resolved fresh from
+    // ownerId at render time (getCombatantColor()), never stored here.
     function getDummyPlayerSource() {
       const realPlayers = game.users.filter((u) => !u.isGM);
       const gmExists = game.users.some((u) => u.isGM);
       if (gmExists && realPlayers.length >= 3) {
-        return realPlayers.map((u) => ({ name: u.name, ownerId: u.id, color: getCombatantColor(u.id) }));
+        return realPlayers.map((u) => ({ name: u.name, ownerId: u.id }));
       }
       return [
-        { name: "Aria", ownerId: "dummy-p1", color: "#5865f2" },
-        { name: "Boro", ownerId: "dummy-p2", color: "#43b581" },
-        { name: "Cass", ownerId: "dummy-p3", color: "#faa61a" },
+        { name: "Aria", ownerId: "dummy-p1" },
+        { name: "Boro", ownerId: "dummy-p2" },
+        { name: "Cass", ownerId: "dummy-p3" },
       ];
     }
 
     function generateDummySegments() {
       const players = getDummyPlayerSource();
-      const gmColor = getCombatantColor(null);
       const monsters = [
-        { name: "Goblin A", color: gmColor },
-        { name: "Goblin B", color: gmColor },
-        { name: "Ogre", color: gmColor },
+        { name: "Goblin A" },
+        { name: "Goblin B" },
+        { name: "Ogre" },
       ];
       // Round-robin interleave - works for any player count, not just 3.
       const order = [];
@@ -520,9 +519,9 @@
           out.push({
             id: uid(), start: t, end: t + dur, trigger: "turn",
             combatantId: `dummy-${entry.name}`, combatantName: entry.name,
-            ownerId: entry.ownerId ?? null, isPC,
+            ownerId: entry.ownerId ?? null,
             defeated: !isPC && round === 2 && entry.name === "Goblin A",
-            color: entry.color, category: "player",
+            category: "player",
           });
           t += dur;
           if (Math.random() < 0.25) {
@@ -530,8 +529,8 @@
             out.push({
               id: uid(), start: t, end: t + pauseDur, trigger: "pause",
               combatantId: `dummy-${entry.name}`, combatantName: entry.name,
-              ownerId: entry.ownerId ?? null, isPC,
-              defeated: false, color: entry.color,
+              ownerId: entry.ownerId ?? null,
+              defeated: false,
               category: Math.random() < 0.5 ? "setup" : "player",
             });
             t += pauseDur;
@@ -562,7 +561,7 @@
       let ms = 0, turns = 0;
       for (const seg of allSegments()) {
         if (!isTracked(seg)) continue;
-        const unclaimedNpcTurn = seg.category === "player" && !seg.isPC && !seg.overrideOwnerId;
+        const unclaimedNpcTurn = seg.category === "player" && !isPlayerControlled(seg);
         const countsForGM = unclaimedNpcTurn || seg.category === "dm";
         if (!countsForGM) continue;
         ms += segMs(seg);
@@ -881,7 +880,7 @@
       const s = Math.round(segMs(seg) / 1000);
       const live = seg.end === null;
       const triggerIcon = seg.trigger === "pause" ? "⏸ " : seg.trigger === "split" ? "✂️ " : (seg.trigger === "unpause" || seg.trigger === "resume") ? "▶ " : "";
-      const who = !seg.combatantId ? "(no combat)" : `${seg.isPC ? "🧑" : "👹"} ${escapeHtml(seg.combatantName)}`;
+      const who = !seg.combatantId ? "(no combat)" : `${isPlayerControlled(seg) ? "🧑" : "👹"} ${escapeHtml(seg.combatantName)}`;
       const defTag = seg.defeated ? " 💀" : "";
       const overrideTag = seg.overrideOwnerId ? ` → ${escapeHtml(game.users.get(seg.overrideOwnerId)?.name ?? "?")}` : "";
       const buttons = Object.entries(CATEGORY_META).map(([key, meta]) => `
