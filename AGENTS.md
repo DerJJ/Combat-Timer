@@ -37,6 +37,7 @@ The atomic unit of tracking — one contiguous slice of time with a single techn
   combatId: string | null,      // Combat document id, for session-boundary detection
   combatantId: string | null,   // Combatant document id
   combatantName: string,
+  actorId: string | null,       // Actor document id - stable across the encounter (and across sessions), unlike combatantId; not consumed anywhere yet
   ownerId: string | null,       // Foundry User id of the owning player; null = true NPC/monster
   overrideOwnerId: string | null, // manual reassignment target; wins over ownerId when set
   isPC: boolean,                 // ownerId !== null (i.e. "player-controlled", not literally actor.type)
@@ -54,7 +55,9 @@ currentSegment: Segment|null // current session, the running one
 sessionHistory: { segments: Segment[], endedAt: number }[]  // ring buffer, max 2, newest first
 ```
 
-Persisted as one JSON blob under `localStorage["ctp-state-<world.id>-<user.id>"]`. **Scope is per-browser, per-Foundry-world, per-Foundry-user.** The user-id component exists specifically so two different Foundry accounts logged in from the same physical browser (e.g. a GM previewing a player account in a second tab) don't collide on the same storage key — Foundry only prevents two concurrent logins as the *same* account, not two different ones from one browser. There is no sync between different users' copies of this script — a GM and each player all have entirely independent tracking state. The only cross-client communication is the static HTML snapshot posted via chat reports; nothing feeds back from chat into tracking.
+Persisted as one JSON blob (`{ v: 1, segments, currentSegment, sessionHistory }`) under `localStorage["ctp-state-<world.id>-<user.id>"]`. `v` exists so a future schema change has a way to tell "this data predates versioning" from "this field is legitimately absent" — nothing currently reads or branches on it; it's a placeholder for exactly one future migration decision, not a general migration framework. **Scope is per-browser, per-Foundry-world, per-Foundry-user.** The user-id component exists specifically so two different Foundry accounts logged in from the same physical browser (e.g. a GM previewing a player account in a second tab) don't collide on the same storage key — Foundry only prevents two concurrent logins as the *same* account, not two different ones from one browser. There is no sync between different users' copies of this script — a GM and each player all have entirely independent tracking state. The only cross-client communication is the static HTML snapshot posted via chat reports; nothing feeds back from chat into tracking.
+
+`loadPersisted()` falls back to the pre-user-scoping key (`ctp-state-<world.id>`, via `legacyStorageKey()`) whenever the current key has no *real* data yet (`hasPersistedData()`: any segments, a running segment, or history) — not just when it's completely absent, since a prior run of the script may already have written an empty state under the new key before this fallback existed. It's read-only as a fallback — the next `persist()` tick writes the adopted data forward under the current key, so this is a one-time, self-healing migration rather than an ongoing dual-read.
 
 `selectedSession` (`"current" | "prev1" | "prev2"`) is pure UI state controlling what `getSelectedSessionData()` / `allSegments()` return for display and chat-report purposes. It never affects what's actually being tracked live — that always follows `game.combat` / `game.paused` regardless of what's on screen.
 
@@ -63,7 +66,7 @@ Persisted as one JSON blob under `localStorage["ctp-state-<world.id>-<user.id>"]
 - `Hooks.on("combatStart" | "updateCombat" [turn/round changed])` → `switchTurn(combat)`
 - `Hooks.on("pauseGame")` → pause/unpause, but only if `game.combat` currently exists (pausing outside combat is not tracked)
 - Script (re)load → `reconcileWithLiveState()`: compares whatever was persisted against the actual live Foundry state (active combatant id + pause state). If it matches, the persisted `currentSegment` is left running untouched (including its original `start` time). If not, it's closed out and a fresh segment opened with trigger `"resume"`.
-- Manual split (✂️ button) → `splitCurrentSegment()`: closes the running segment and opens a new one with trigger `"split"`, carrying over the same technical identity (`combatId`/`combatantId`/`ownerId`/`isPC`/`defeated`/`color`).
+- Manual split (✂️ button) → `splitCurrentSegment()`: closes the running segment and opens a new one with trigger `"split"`, carrying over the same technical identity and category (`combatId`/`combatantId`/`actorId`/`ownerId`/`isPC`/`defeated`/`color`/`category`) — a split is a continuation, not a reclassification, so it does not run back through `defaultCategory()`.
 - Manual category/player reassignment: mutates an existing segment's `category`/`overrideOwnerId` in place (no new segment created).
 
 Only triggers `"turn"` and `"resume"` mark a genuinely new turn boundary (see `isTurnStart()` in Timing statistics) — never `"pause"`, `"unpause"`, or `"split"`, since those are continuations of an already-counted turn rather than new ones. `"resume"` counts because, by construction, `reconcileWithLiveState()` only ever creates one when live state does *not* match what was persisted — meaning it always represents either a genuinely new turn discovered after a reload, or a turn change missed while reloading. Either way it hasn't been counted anywhere else.
@@ -112,9 +115,14 @@ Four categories: `player`, `dm`, `team`, `setup`.
 
 ## Chat output
 
-`buildBarsContent()` and `buildPlayerListContent()` each return a standalone HTML string (see hard constraint #2 for the styling rules). Both are posted via:
+`buildBarsContent()` and `buildPlayerListContent()` each return a standalone HTML string (see hard constraint #2 for the styling rules). Both are posted via `postToChat(content, kind)`:
 ```js
-ChatMessage.create({ content, speaker: ChatMessage.getSpeaker(), whisper: [game.user.id] });
+ChatMessage.create({
+  content,
+  speaker: ChatMessage.getSpeaker({ alias: "Combat Timer" }), // not the default - avoids posting under whatever token happens to be selected
+  whisper: [game.user.id],
+  flags: { "combat-timer": { kind, session: selectedSession, at: Date.now() } }, // kind: "bars" | "players"; lets a future feature find/identify its own past reports
+});
 ```
 Always self-only ("self roll" semantics) — there is deliberately no in-panel "reveal to everyone" button; Foundry's own chat-message context menu already offers "Reveal to Everyone" for any message the current user authored and whispered to themselves, so it isn't reimplemented here.
 

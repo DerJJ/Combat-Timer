@@ -49,10 +49,25 @@
     function storageKey() {
       return `ctp-state-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
+    // Pre-user-scoping data lived under this key (no user id suffix). Only
+    // read as a fallback, never written to - the next persist() tick writes
+    // the adopted data forward under storageKey(), self-healing the migration.
+    function legacyStorageKey() {
+      return `ctp-state-${game.world?.id ?? "default"}`;
+    }
+    function hasPersistedData(state) {
+      return !!state && (state.segments?.length > 0 || !!state.currentSegment || state.sessionHistory?.length > 0);
+    }
     function loadPersisted() {
       try {
-        const raw = localStorage.getItem(storageKey());
-        return raw ? JSON.parse(raw) : null;
+        const current = JSON.parse(localStorage.getItem(storageKey()) ?? "null");
+        if (hasPersistedData(current)) return current;
+        // Nothing (or only an empty state already written by a prior run of
+        // this script) under the current key - fall back to whatever the
+        // pre-user-scoping key holds, so an empty write doesn't permanently
+        // block the one-time migration.
+        const legacy = JSON.parse(localStorage.getItem(legacyStorageKey()) ?? "null");
+        return hasPersistedData(legacy) ? legacy : current;
       } catch (e) {
         console.warn("Combat Timer: could not load saved state", e);
         return null;
@@ -60,7 +75,7 @@
     }
     function persist() {
       try {
-        localStorage.setItem(storageKey(), JSON.stringify({ segments, currentSegment, sessionHistory }));
+        localStorage.setItem(storageKey(), JSON.stringify({ v: 1, segments, currentSegment, sessionHistory }));
       } catch (e) {
         console.warn("Combat Timer: could not save state", e);
       }
@@ -127,6 +142,7 @@
         combatId, // which Combat document this belongs to - used to detect a genuinely new encounter
         combatantId: combatant?.id ?? null,
         combatantName: combatant?.name ?? combatant?.token?.name ?? "–",
+        actorId: combatant?.actor?.id ?? null, // stable across the encounter (and across sessions), unlike combatantId
         ownerId,
         overrideOwnerId: null, // manual reassignment to a specific player, wins over ownerId
         isPC: ownerId !== null,
@@ -148,10 +164,12 @@
         combatId: currentSegment.combatId,
         combatantId: currentSegment.combatantId,
         combatantName: currentSegment.combatantName,
+        actorId: currentSegment.actorId,
         ownerId: currentSegment.ownerId,
         isPC: currentSegment.isPC,
         defeated: currentSegment.defeated,
         color: currentSegment.color,
+        category: currentSegment.category, // a split keeps the same category, not defaultCategory()'s guess
       };
       closeSegment();
       currentSegment = {
@@ -161,7 +179,6 @@
         trigger: "split",
         overrideOwnerId: null,
         ...carryOver,
-        category: defaultCategory("split", segments[segments.length - 1] ?? null),
       };
       selectedSession = "current";
       persist();
@@ -596,14 +613,14 @@
             </div>
             <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
               <div style="width:${pct}%; height:100%; background:${e.color} !important;
-                   box-shadow:inset 0 1px 0 rgba(255,255,255,0.25); border-radius:4px;"></div>
+                   box-shadow:inset 0 1px 0 rgba(255,255,255,0.25) !important; border-radius:4px;"></div>
             </div>
           </div>`;
       }).join("");
 
       return `
         <div style="font-family:Signika,sans-serif; font-size:13px; color:#eee !important;
-             background:linear-gradient(160deg,#2a2a35,#1b1b22) !important; border:1px solid #45414f;
+             background:linear-gradient(160deg,#2a2a35,#1b1b22) !important; border:1px solid #45414f !important;
              border-radius:8px; padding:10px 12px;">
           <div style="font-weight:700; letter-spacing:0.3px; margin-bottom:6px; color:#eee !important; display:flex; justify-content:space-between; align-items:baseline;">
             <span>⚔️ Combat Times</span>
@@ -640,7 +657,7 @@
 
       return `
         <div style="font-family:Signika,sans-serif; font-size:13px; color:#eee !important;
-             background:linear-gradient(160deg,#2a2a35,#1b1b22) !important; border:1px solid #45414f;
+             background:linear-gradient(160deg,#2a2a35,#1b1b22) !important; border:1px solid #45414f !important;
              border-radius:8px; padding:10px 12px;">
           <div style="font-weight:700; letter-spacing:0.3px; margin-bottom:2px; color:#eee !important; display:flex; justify-content:space-between; align-items:baseline;">
             <span>🧑 Player Overview</span>
@@ -668,11 +685,12 @@
       persist();
     }
 
-    async function postToChat(content) {
+    async function postToChat(content, kind) {
       await ChatMessage.create({
         content,
-        speaker: ChatMessage.getSpeaker(),
+        speaker: ChatMessage.getSpeaker({ alias: "Combat Timer" }),
         whisper: [game.user.id],
+        flags: { "combat-timer": { kind, session: selectedSession, at: Date.now() } },
       });
     }
 
@@ -744,8 +762,8 @@
       el.querySelector("#ctp-close").addEventListener("click", () => closePanel());
       el.querySelector("#ctp-dummy").addEventListener("click", () => loadDummyData());
       el.querySelector("#ctp-reset").addEventListener("click", () => deleteSelectedSession());
-      el.querySelector("#ctp-post-bars").addEventListener("click", () => postToChat(buildBarsContent()));
-      el.querySelector("#ctp-post-players").addEventListener("click", () => postToChat(buildPlayerListContent()));
+      el.querySelector("#ctp-post-bars").addEventListener("click", () => postToChat(buildBarsContent(), "bars"));
+      el.querySelector("#ctp-post-players").addEventListener("click", () => postToChat(buildPlayerListContent(), "players"));
 
       el.querySelector("#ctp-header").addEventListener("mousedown", (ev) => {
         const rect = el.getBoundingClientRect();
