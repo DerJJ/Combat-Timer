@@ -97,10 +97,12 @@
       return gm ? gm.color.css : "#c0392b";
     }
 
+    const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one
+
     function defaultCategory(trigger, prevSegment) {
       if (trigger === "pause") {
-        const prevDur = prevSegment ? Date.now() - prevSegment.start : Infinity;
-        if (prevDur < 5000) return "setup";
+        const prevDur = prevSegment ? segMs(prevSegment) : Infinity;
+        if (prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
         return prevSegment ? prevSegment.category : "setup";
       }
       return "player";
