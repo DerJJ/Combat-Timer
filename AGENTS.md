@@ -128,7 +128,7 @@ ChatMessage.create({
 Always self-only ("self roll" semantics) — there is deliberately no in-panel "reveal to everyone" button; Foundry's own chat-message context menu already offers "Reveal to Everyone" for any message the current user authored and whispered to themselves, so it isn't reimplemented here.
 
 - `buildBarsContent()`: one bar per player (via `perCombatantStats()` — every entry it returns is already a real player, so no further filtering is needed), plus one combined "GM" bar (`gmTotalStats()`), plus a "Team" bar (anthracite `#383E42`) and a "Setup" bar (GM's color) whenever those categories have any time at all — all sorted together by total time descending, not shown separately or omitted when zero.
-- `buildPlayerListContent()`: one stacked block per player (name on its own full-width line, three stats — avg turn / avg gap / total wait — on the line below). Deliberately `<div>`-based, not a `<table>`, both to avoid host CSS leakage and because a 4-column table didn't fit Foundry's narrow chat sidebar without wrapping.
+- `buildPlayerListContent()`: one stacked block per player (name on its own full-width line, three stats — avg turn / avg gap / total wait — on the line below), sorted by total time descending — the same order as `buildBarsContent()`, so the two reports line up when read side by side. Deliberately `<div>`-based, not a `<table>`, both to avoid host CSS leakage and because a 4-column table didn't fit Foundry's narrow chat sidebar without wrapping.
 
 ## Multi-server support
 

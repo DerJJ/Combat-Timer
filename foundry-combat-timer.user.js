@@ -642,7 +642,7 @@
       const gaps = betweenTurnStats();
       const waits = absoluteWaitStats();
       const rows = perCombatantStats()
-        .sort((a, b) => a.name.localeCompare(b.name))
+        .sort((a, b) => b.totalMs - a.totalMs)
         .map((e) => {
           const avgTurn = e.turnCount ? Math.round(e.totalMs / e.turnCount / 1000) : 0;
           const turnCountTag = e.turnCount ? ` (${e.turnCount}×)` : "";
