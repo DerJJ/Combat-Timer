@@ -620,7 +620,7 @@
         .map((e) => {
           const avgTurn = e.turnCount ? Math.round(e.totalMs / e.turnCount / 1000) : 0;
           const g = gaps.get(e.id);
-          const turnsLabel = g && g.count ? `${g.count} turn${g.count !== 1 ? "s" : ""}` : "";
+          const turnsLabel = e.turnCount ? `${e.turnCount} turn${e.turnCount !== 1 ? "s" : ""}` : "";
           const avgGap = g && g.count ? `${formatDuration(Math.round(g.avgMs / 1000))} (${turnsLabel})` : "–";
           const waitMs = waits.get(e.id) ?? 0;
           return `
