@@ -272,6 +272,14 @@
       const sec = s % 60;
       return m > 0 ? `${m}m${String(sec).padStart(2, "0")}s` : `${sec}s`;
     }
+    // Every name interpolated into innerHTML/ChatMessage content goes through
+    // this first - names come from token/actor/user names, which anyone with
+    // rename permission controls, and chat content can be seen by other
+    // clients after "Reveal to Everyone".
+    function escapeHtml(s) {
+      return String(s ?? "").replace(/[&<>"']/g, (c) =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
     function findSegment(id) {
       return allSegments().find((s) => s.id === id) ?? null;
     }
@@ -608,7 +616,7 @@
         return `
           <div style="margin:6px 0;">
             <div style="display:flex; justify-content:space-between; font-size:11px; margin-bottom:2px; color:#eee !important;">
-              <span style="color:#eee !important;">${e.icon} ${e.name}</span>
+              <span style="color:#eee !important;">${e.icon} ${escapeHtml(e.name)}</span>
               <span style="opacity:0.85; color:#eee !important;">${formatDuration(s)}${avg}</span>
             </div>
             <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
@@ -645,7 +653,7 @@
             <div style="margin:8px 0;">
               <div style="display:flex; align-items:center; gap:6px; font-weight:600; color:#eee !important;">
                 <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:${e.color} !important; flex-shrink:0;"></span>
-                <span style="color:#eee !important;">${e.name}</span>
+                <span style="color:#eee !important;">${escapeHtml(e.name)}</span>
               </div>
               <div style="display:flex; justify-content:space-between; gap:8px; font-size:10px; opacity:0.8; margin-top:2px; padding-left:14px; color:#eee !important;">
                 <span style="color:#eee !important;">Turn: ${formatDuration(avgTurn)}${turnCountTag}</span>
@@ -868,9 +876,9 @@
       const s = Math.round(segMs(seg) / 1000);
       const live = seg.end === null;
       const triggerIcon = seg.trigger === "pause" ? "⏸ " : seg.trigger === "split" ? "✂️ " : (seg.trigger === "unpause" || seg.trigger === "resume") ? "▶ " : "";
-      const who = !seg.combatantId ? "(no combat)" : `${seg.isPC ? "🧑" : "👹"} ${seg.combatantName}`;
+      const who = !seg.combatantId ? "(no combat)" : `${seg.isPC ? "🧑" : "👹"} ${escapeHtml(seg.combatantName)}`;
       const defTag = seg.defeated ? " 💀" : "";
-      const overrideTag = seg.overrideOwnerId ? ` → ${game.users.get(seg.overrideOwnerId)?.name ?? "?"}` : "";
+      const overrideTag = seg.overrideOwnerId ? ` → ${escapeHtml(game.users.get(seg.overrideOwnerId)?.name ?? "?")}` : "";
       const buttons = Object.entries(CATEGORY_META).map(([key, meta]) => `
         <span data-seg-id="${seg.id}" data-cat="${key}"
           style="cursor:pointer; padding:1px 5px; border-radius:4px; font-size:11px;
@@ -888,7 +896,7 @@
           ...players.map((p) => `
             <span data-seg-id="${seg.id}" data-owner-pick="${p.ownerId}"
               style="cursor:pointer; padding:1px 6px; border-radius:4px; font-size:10px; margin:2px;
-                     background:${p.color}; color:#fff;">${p.name}</span>`),
+                     background:${p.color}; color:#fff;">${escapeHtml(p.name)}</span>`),
         ].join("");
         picker = `<div style="margin-top:3px; padding-top:3px; border-top:1px dashed rgba(255,255,255,0.15);">${chips}</div>`;
       }
@@ -967,7 +975,7 @@
         let next = "";
         if (combat?.turns?.length) {
           const n = combat.turns[(combat.turn + 1) % combat.turns.length];
-          if (n) next = ` · Next: ${n.name}`;
+          if (n) next = ` · Next: ${escapeHtml(n.name)}`;
         }
         statusEl.innerHTML = `${combat ? "Combat active" : "No active combat"}${pausedTag}${next}<br>
           <span style="opacity:0.7;">Total pause (real): ${formatDuration(totalPausedRealS())}</span>`;
@@ -982,7 +990,7 @@
           return `<div style="display:flex; align-items:center; gap:6px; padding:2px 0;">
             <span style="width:8px; height:8px; border-radius:50%; background:${e.color}; flex-shrink:0;"></span>
             <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-              🧑 ${e.name}
+              🧑 ${escapeHtml(e.name)}
             </span>
             <span style="opacity:0.85; font-size:11px;">${formatDuration(s)}${avg}</span>
           </div>`;
