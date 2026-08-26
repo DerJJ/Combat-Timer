@@ -131,25 +131,46 @@
       }
     }
 
-    function openSegment(trigger, combatant, combat = null) {
-      const prev = segments[segments.length - 1] ?? null;
-      const ownerId = getOwningPlayerId(combatant?.actor);
-      currentSegment = {
+    // Single source of truth for the Segment shape - every field gets a
+    // default here, so a caller (real tracking, a split, dummy data) only
+    // has to specify what's actually different from "nothing". Adding a new
+    // field means adding it once, here, instead of hunting down every place
+    // a segment literal gets built by hand and hoping none get missed.
+    function makeSegment(overrides) {
+      return {
         id: uid(),
         start: Date.now(),
         end: null,
-        trigger, // "turn" | "pause" | "unpause" | "resume" | "split"
-        combatId: combat?.id ?? null, // which Combat document this belongs to - used to detect a genuinely new encounter
-        round: combat?.round ?? null, // only known at creation time - can't be reconstructed later from timestamps alone
+        trigger: null, // "turn" | "pause" | "unpause" | "resume" | "split"
+        combatId: null, // which Combat document this belongs to - used to detect a genuinely new encounter
+        round: null, // only known at creation time - can't be reconstructed later from timestamps alone
+        turnIndex: null,
+        combatantId: null,
+        combatantName: "–",
+        actorId: null, // stable across the encounter (and across sessions), unlike combatantId
+        ownerId: null,
+        overrideOwnerId: null, // manual reassignment to a specific player, wins over ownerId
+        defeated: false,
+        category: "player",
+        ...overrides,
+      };
+    }
+
+    function openSegment(trigger, combatant, combat = null) {
+      const prev = segments[segments.length - 1] ?? null;
+      const ownerId = getOwningPlayerId(combatant?.actor);
+      currentSegment = makeSegment({
+        trigger,
+        combatId: combat?.id ?? null,
+        round: combat?.round ?? null,
         turnIndex: combat?.turn ?? null,
         combatantId: combatant?.id ?? null,
         combatantName: combatant?.name ?? combatant?.token?.name ?? "–",
-        actorId: combatant?.actor?.id ?? null, // stable across the encounter (and across sessions), unlike combatantId
+        actorId: combatant?.actor?.id ?? null,
         ownerId,
-        overrideOwnerId: null, // manual reassignment to a specific player, wins over ownerId
         defeated: combatant?.isDefeated ?? false,
         category: defaultCategory(trigger, prev),
-      };
+      });
     }
 
     // Manually split the currently running segment right now, e.g. to carve
@@ -160,26 +181,16 @@
     // from turnCount, same as "unpause"/"resume").
     function splitCurrentSegment() {
       if (!currentSegment) return;
-      const carryOver = {
-        combatId: currentSegment.combatId,
-        round: currentSegment.round,
-        turnIndex: currentSegment.turnIndex,
-        combatantId: currentSegment.combatantId,
-        combatantName: currentSegment.combatantName,
-        actorId: currentSegment.actorId,
-        ownerId: currentSegment.ownerId,
-        defeated: currentSegment.defeated,
-        category: currentSegment.category, // a split keeps the same category, not defaultCategory()'s guess
-      };
+      const carryOver = { ...currentSegment }; // copy before closeSegment() mutates the original's `end`
       closeSegment();
-      currentSegment = {
+      currentSegment = makeSegment({
+        ...carryOver, // same technical identity and category - a split is a continuation, not a reclassification
         id: uid(),
         start: Date.now(),
         end: null,
         trigger: "split",
-        overrideOwnerId: null,
-        ...carryOver,
-      };
+        overrideOwnerId: null, // a split does NOT inherit a manual reassignment - it reverts to the technical owner
+      });
       selectedSession = "current";
       persist();
     }
@@ -531,25 +542,23 @@
         for (const [turnIndex, entry] of order.entries()) {
           const isPC = !!entry.ownerId;
           const dur = randomTurnDurationMs();
-          out.push({
-            id: uid(), start: t, end: t + dur, trigger: "turn",
+          out.push(makeSegment({
+            start: t, end: t + dur, trigger: "turn",
             combatantId: `dummy-${entry.name}`, combatantName: entry.name,
             round: round + 1, turnIndex, // Foundry rounds are 1-indexed, turn index is 0-indexed
             ownerId: entry.ownerId ?? null,
             defeated: !isPC && round === 2 && entry.name === "Goblin A",
-            category: "player",
-          });
+          }));
           t += dur;
           if (Math.random() < 0.25) {
             const pauseDur = randomPauseDurationMs();
-            out.push({
-              id: uid(), start: t, end: t + pauseDur, trigger: "pause",
+            out.push(makeSegment({
+              start: t, end: t + pauseDur, trigger: "pause",
               combatantId: `dummy-${entry.name}`, combatantName: entry.name,
               round: round + 1, turnIndex,
               ownerId: entry.ownerId ?? null,
-              defeated: false,
               category: Math.random() < 0.5 ? "setup" : "player",
-            });
+            }));
             t += pauseDur;
           }
         }
