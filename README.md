@@ -49,10 +49,10 @@ The panel opens automatically. If you close it (✕), a small reopen button appe
 - **🆕 / 🗑️** (top right): starts a new session (archiving the current one) when you're viewing "Now", or permanently deletes an archived session when viewing "-1"/"-2".
 - **🧪**: loads randomized dummy data (3 players, 3 monsters, 3 rounds) so you can try out the panel and chat reports without a live combat. Only works when the current session is empty.
 - **✕**: hides the panel (use the reopen button on the left edge to bring it back).
-- **Session tabs** (🟢 Now / 📦 -1 / 📦 -2): switch which session's data is shown and posted to chat. Greyed-out tabs have no data yet.
+- **Session tabs** (🟢 Now / 📦 -1 / 📦 -2): switch which session's data is shown and posted to chat. Greyed-out tabs have no data yet, but you can still open one — that's how you get an empty "-1"/"-2" slot ready to receive an import.
 - **✂️**: splits the currently running segment right now, e.g. to carve out a reaction or interrupt mid-turn so it can be categorized separately.
 - **📤 Export / 📥 Import**: save whichever session tab (Now / -1 / -2) you're currently viewing to a JSON file, or load one back in. Import replaces that tab's data outright — there's a confirmation prompt, but no undo, so export first if you're unsure. Handy for backing up a session, or moving one to a different browser/computer.
-- **Segment list**: every tracked slice of time, each with five small icons (🧑 Player / 🎲 GM / 👥 Team / 🛠️ Setup / 🚫 Ignore) to change its category. Tapping 🧑 opens a picker so you can assign that time to *any* player, not just whoever's turn it technically was. **🚫 Ignore** excludes a slice from every total and every player's stats entirely — for when the session picks back up days later and a segment ends up spanning that whole real-world gap: split it off with ✂️ first, then mark the now-closed, days-long segment 🚫.
+- **Segment list**: every tracked slice of time for the whole session (scroll for older ones), each with five small icons (🧑 Player / 🎲 GM / 👥 Team / 🛠️ Setup / 🚫 Ignore) to change its category. Tapping 🧑 opens a picker so you can assign that time to *any* player, not just whoever's turn it technically was. **🚫 Ignore** excludes a slice from every total and every player's stats entirely — for when the session picks back up days later and a segment ends up spanning that whole real-world gap: split it off with ✂️ first, then mark the now-closed, days-long segment 🚫. A "🔄 Round N" marker appears wherever a new round starts.
 
 ### Chat reports
 

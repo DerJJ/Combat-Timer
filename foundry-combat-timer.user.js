@@ -1218,6 +1218,37 @@
         </div>`;
     }
 
+    function roundMarkerHTML(round) {
+      return `
+        <div style="text-align:center; font-size:10px; letter-spacing:0.5px; opacity:0.55;
+                    margin:3px 0; padding:2px 0;
+                    border-top:1px dashed rgba(255,255,255,0.15); border-bottom:1px dashed rgba(255,255,255,0.15);">
+          🔄 Round ${round}
+        </div>`;
+    }
+
+    // Interleaves "new round" markers into the (chronological) segment list
+    // wherever the round number advances at a turn start, then reverses the
+    // whole thing so the newest entry ends up on top.
+    function buildSegmentTimeline(viewSegs, viewCurrent) {
+      const items = [];
+      let lastRound = null;
+      for (const seg of viewSegs) {
+        if (isTurnStart(seg) && seg.round != null && seg.round !== lastRound) {
+          items.push({ marker: seg.round });
+          lastRound = seg.round;
+        }
+        items.push({ seg });
+      }
+      if (viewCurrent) {
+        if (isTurnStart(viewCurrent) && viewCurrent.round != null && viewCurrent.round !== lastRound) {
+          items.push({ marker: viewCurrent.round });
+        }
+        items.push({ seg: viewCurrent });
+      }
+      return items.reverse();
+    }
+
     function renderPanel() {
       persist();
       if (!panelVisible || !document.body.contains(panel)) return;
@@ -1225,20 +1256,22 @@
       // Toolbar: split button + session tabs, all equal width so it looks
       // like one consistent row of buttons.
       const toolbarEl = panel.querySelector("#ctp-toolbar");
+      // "available" only affects dimming, not whether the tab can be opened -
+      // an empty archived slot must still be selectable so imported data has
+      // somewhere to land.
       const tabs = [
-        { key: "current", label: "🟢 Now", available: true },
-        { key: "prev1", label: "📦 -1", available: !!sessionHistory[0] },
-        { key: "prev2", label: "📦 -2", available: !!sessionHistory[1] },
+        { key: "current", label: "🟢 Now", hasData: true },
+        { key: "prev1", label: "📦 -1", hasData: !!sessionHistory[0] },
+        { key: "prev2", label: "📦 -2", hasData: !!sessionHistory[1] },
       ];
       const splitHTML = `
         <span data-action="split" style="flex:1; text-align:center; cursor:pointer; padding:3px 2px;
               border-radius:4px; opacity:0.75;">✂️</span>`;
       const tabsHTML = tabs.map((t) => `
-        <span data-session="${t.key}" data-available="${t.available}"
-          style="flex:1; text-align:center; padding:3px 2px; border-radius:4px;
-                 cursor:${t.available ? "pointer" : "default"};
+        <span data-session="${t.key}"
+          style="flex:1; text-align:center; padding:3px 2px; border-radius:4px; cursor:pointer;
                  ${selectedSession === t.key ? "background:#4b3fa0;" : ""}
-                 opacity:${t.available ? (selectedSession === t.key ? "1" : "0.6") : "0.25"};">${t.label}</span>
+                 opacity:${selectedSession === t.key ? "1" : (t.hasData ? "0.6" : "0.35")};">${t.label}</span>
       `).join("");
       toolbarEl.innerHTML = splitHTML + tabsHTML;
 
@@ -1252,7 +1285,6 @@
       });
       toolbarEl.querySelectorAll("[data-session]").forEach((el) => {
         el.addEventListener("click", () => {
-          if (el.dataset.available !== "true") return;
           selectedSession = el.dataset.session;
           renderPanel();
         });
@@ -1272,9 +1304,14 @@
       if (selectedSession !== "current") {
         const idx = selectedSession === "prev1" ? 0 : 1;
         const hist = sessionHistory[idx];
-        const when = hist ? new Date(hist.endedAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }) : "";
-        statusEl.innerHTML = `📦 Archived session (ended ${when})<br>
-          <span style="opacity:0.7;">Total pause (real): ${formatDuration(totalPausedRealS())}</span>`;
+        if (!hist) {
+          statusEl.innerHTML = `📦 No data in this slot yet<br>
+            <span style="opacity:0.7;">Import a session file to fill it, or it'll fill itself the next time a session archives.</span>`;
+        } else {
+          const when = new Date(hist.endedAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
+          statusEl.innerHTML = `📦 Archived session (ended ${when})<br>
+            <span style="opacity:0.7;">Total pause (real): ${formatDuration(totalPausedRealS())}</span>`;
+        }
       } else {
         const combat = game.combat;
         const pausedTag = game.paused ? " ⏸ Paused" : "";
@@ -1312,8 +1349,10 @@
 
       const segEl = panel.querySelector("#ctp-segments");
       const { segs: viewSegs, current: viewCurrent } = getSelectedSessionData();
-      const list = [viewCurrent, ...viewSegs.slice().reverse()].filter(Boolean).slice(0, 15);
-      segEl.innerHTML = list.map(segmentRowHTML).join("");
+      const timeline = buildSegmentTimeline(viewSegs, viewCurrent);
+      segEl.innerHTML = timeline.length
+        ? timeline.map((item) => item.marker !== undefined ? roundMarkerHTML(item.marker) : segmentRowHTML(item.seg)).join("")
+        : `<div style="opacity:0.5; padding:6px 0; font-size:11px;">No data yet - import a session or wait for combat to start.</div>`;
       segEl.querySelectorAll("[data-cat]").forEach((el) => {
         el.addEventListener("click", () => {
           const seg = findSegment(el.dataset.segId);
