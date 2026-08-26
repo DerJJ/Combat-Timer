@@ -480,7 +480,11 @@
       const slots = buildTurnSlots();
       const byOwner = new Map();
       for (const s of slots) {
-        if (!s.designatedOwner) continue;
+        // A slot's designatedOwner comes straight from the opening segment's
+        // ownerId regardless of category - a stray "setup" blip (e.g. a
+        // tracker mis-click) still carries a real player's id and would
+        // otherwise slice one genuine gap into two much smaller fake ones.
+        if (!s.designatedOwner || s.segments[0].category !== "player" || !isRealTurn(s.segments[0])) continue;
         if (!byOwner.has(s.designatedOwner)) byOwner.set(s.designatedOwner, []);
         byOwner.get(s.designatedOwner).push(s);
       }
