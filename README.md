@@ -58,7 +58,7 @@ The panel opens automatically. If you close it (✕), a small reopen button appe
 
 Two buttons post a report to chat, visible only to you at first ("self roll" / whisper to yourself). Right-click your own message in the chat log and choose **Reveal to Everyone** if you want to share it — Foundry handles that natively, no extra step needed on our side.
 
-- **📊 Post bar chart**: total time per player plus one combined GM bar, sorted by time spent.
+- **📊 Post bar chart**: total time per player plus one combined GM bar, sorted by time spent, with a percentage of the session total next to each. If a player controls more than one token (a character plus a familiar or summon), their bar splits into one segment per token — their own character always rightmost in their full color, other tokens trailing to the left in progressively darker shades. A thin second row appears under a player's bar whenever they have any paused or reassigned ("out-of-turn") time, breaking each token's segment down further so you can see at a glance how much of it was normal turn time versus a pause or a reassignment.
 - **🧑 Post player list**: per player, average turn length, average gap between their turns, and total time spent waiting.
 
 ### A new combat, a new session

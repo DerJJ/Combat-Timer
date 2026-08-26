@@ -373,9 +373,18 @@
         }
         return map.get(id);
       };
-      const getEntity = (owner, combatantId, name) => {
-        if (!owner.byEntity.has(combatantId)) owner.byEntity.set(combatantId, { combatantId, name, inTurnMs: 0, turnCount: 0 });
-        return owner.byEntity.get(combatantId);
+      // seg's own combatantId/combatantName/actorType, not the slot's - an
+      // out-of-turn credit's entity is whichever combatant actually did the
+      // acting (e.g. the monster a redirected defeated-NPC segment came
+      // from), which can differ from the owner's other entities entirely.
+      const getEntity = (owner, seg) => {
+        if (!owner.byEntity.has(seg.combatantId)) {
+          owner.byEntity.set(seg.combatantId, {
+            combatantId: seg.combatantId, name: seg.combatantName, actorType: seg.actorType,
+            inTurnMs: 0, outOfTurnMs: 0, pausedMs: 0, turnCount: 0,
+          });
+        }
+        return owner.byEntity.get(seg.combatantId);
       };
 
       const lastLiveOwner = lastLiveOwnerByCombatant();
@@ -384,21 +393,23 @@
         if (slot.designatedOwner && opening.category === "player" && isRealTurn(opening)) {
           const owner = getOwner(slot.designatedOwner);
           owner.turnCount += 1;
-          getEntity(owner, opening.combatantId, opening.combatantName).turnCount += 1;
+          getEntity(owner, opening).turnCount += 1;
         }
         for (const seg of slot.segments) {
           if (seg.category !== "player" || !hasCombatContext(seg)) continue;
           const owner = effectiveOwner(seg, lastLiveOwner);
           if (!owner) continue; // unclaimed NPC turn -> npcAggregate/gmTotalStats instead
           const e = getOwner(owner);
+          const entity = getEntity(e, seg);
           const ms = segMs(seg);
           e.totalMs += ms;
-          if (seg.trigger === "pause") e.pausedMs += ms;
+          if (seg.trigger === "pause") { e.pausedMs += ms; entity.pausedMs += ms; }
           if (owner === slot.designatedOwner) {
             e.inTurnMs += ms;
-            getEntity(e, seg.combatantId, seg.combatantName).inTurnMs += ms;
+            entity.inTurnMs += ms;
           } else {
             e.outOfTurnMs += ms;
+            entity.outOfTurnMs += ms;
           }
         }
       }
@@ -643,16 +654,23 @@
     // pause that was really the GM's time, not the player's).
     function gmTotalStats() {
       let ms = 0, turns = 0;
+      const byEntity = new Map();
       const lastLiveOwner = lastLiveOwnerByCombatant();
       for (const seg of allSegments()) {
         if (!hasCombatContext(seg)) continue;
         const unclaimedNpcTurn = seg.category === "player" && effectiveOwner(seg, lastLiveOwner) === null;
         const countsForGM = unclaimedNpcTurn || seg.category === "dm";
         if (!countsForGM) continue;
-        ms += segMs(seg);
-        if (isRealTurn(seg)) turns += 1;
+        const segDurMs = segMs(seg);
+        ms += segDurMs;
+        if (!byEntity.has(seg.combatantId)) {
+          byEntity.set(seg.combatantId, { combatantId: seg.combatantId, name: seg.combatantName, ms: 0, turnCount: 0 });
+        }
+        const entity = byEntity.get(seg.combatantId);
+        entity.ms += segDurMs;
+        if (isRealTurn(seg)) { turns += 1; entity.turnCount += 1; }
       }
-      return { totalMs: ms, turnCount: turns };
+      return { totalMs: ms, turnCount: turns, byEntity: [...byEntity.values()] };
     }
 
     // All players worth offering in the reassignment picker: currently in
@@ -676,6 +694,108 @@
     }
 
     // ---- Chat reports (always self-roll, i.e. whisper to yourself) ----
+
+    // Scales each RGB channel by `factor` (1 = unchanged, <1 = darker).
+    // Computed as real hex values rather than a CSS filter, since a filter
+    // is easier for an aggressive Foundry/system theme to override, and
+    // hard constraint #2 wants every color fully inline and self-contained.
+    function darkenHex(hex, factor) {
+      const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex);
+      if (!m) return hex;
+      const scale = (h) => Math.round(parseInt(h, 16) * factor).toString(16).padStart(2, "0");
+      return `#${scale(m[1])}${scale(m[2])}${scale(m[3])}`;
+    }
+
+    // Orders a list of per-entity items so the "primary" one (a player's own
+    // PC, found via isPrimary) ends up last/rightmost in full color, with
+    // every other entity trailing to its left in progressively darker shades
+    // of the same base color, in their original (turn-order) sequence. With
+    // no primary match (e.g. the GM's monsters), the last item in original
+    // order anchors instead, so "rightmost = brightest" holds everywhere.
+    function orderAndShade(items, isPrimary) {
+      if (!items.length) return [];
+      const primaryIdx = items.findIndex(isPrimary);
+      const primary = primaryIdx >= 0 ? items[primaryIdx] : items[items.length - 1];
+      const ordered = [...items.filter((it) => it !== primary), primary];
+      const minShade = 0.45;
+      return ordered.map((item, i) => ({
+        item,
+        shade: ordered.length <= 1 ? 1 : minShade + (1 - minShade) * (i / (ordered.length - 1)),
+      }));
+    }
+
+    // Renders one row's worth of proportional, colored sub-segments sharing
+    // a common parent width. A part's label is only drawn when its own
+    // share is wide enough to plausibly fit it - a narrow sliver still
+    // contributes its color and proportion, just without forcing illegible
+    // text into it (per design: show every part, label only where it fits).
+    function proportionalSegmentsHtml(parts, minLabelPct) {
+      const total = parts.reduce((sum, p) => sum + p.ms, 0) || 1;
+      return parts.filter((p) => p.ms > 0).map((p) => {
+        const w = (p.ms / total) * 100;
+        const label = p.label && w >= minLabelPct
+          ? `<span style="font-size:8px; font-weight:600; color:rgba(0,0,0,0.55); white-space:nowrap;">${p.label}</span>`
+          : "";
+        return `<div style="width:${w}%; height:100%; background:${p.color} !important;
+                     box-shadow:inset 0 1px 0 rgba(255,255,255,0.25) !important;
+                     display:flex; align-items:center; justify-content:center; overflow:hidden;">${label}</div>`;
+      }).join("");
+    }
+
+    // Builds the main (solid, per-entity) bar segments and, only when there's
+    // something exceptional to show, a slim aligned indicator row splitting
+    // each entity's own column into paused / out-of-turn / in-turn. For an
+    // ordinary single-entity player with no paused/out-of-turn time this
+    // degenerates to exactly today's single solid bar with no indicator row.
+    function buildPlayerBarRows(e) {
+      const ordered = orderAndShade(e.byEntity, (en) => en.actorType === "character")
+        .map(({ item, shade }) => ({ item, color: darkenHex(e.color, shade) }));
+      const showLabels = ordered.length > 1;
+      const personTotalMs = e.byEntity.reduce((sum, en) => sum + en.inTurnMs + en.outOfTurnMs, 0) || 1;
+
+      const mainParts = ordered.map(({ item, color }) => ({
+        ms: item.inTurnMs + item.outOfTurnMs,
+        color,
+        label: showLabels ? formatDuration(Math.round((item.inTurnMs + item.outOfTurnMs) / 1000)) : null,
+      }));
+      const mainSegs = proportionalSegmentsHtml(mainParts, 12);
+
+      let indicatorRow = "";
+      if (e.pausedMs > 0 || e.outOfTurnMs > 0) {
+        const cols = ordered.map(({ item, color }) => {
+          const entMs = item.inTurnMs + item.outOfTurnMs;
+          if (entMs <= 0) return "";
+          const colWidth = (entMs / personTotalMs) * 100;
+          const pausedMs = Math.min(item.pausedMs, entMs);
+          const inTurnPlainMs = Math.max(0, entMs - pausedMs - item.outOfTurnMs);
+          const parts = proportionalSegmentsHtml([
+            { ms: pausedMs, color: "#e8a33d" }, // fixed, entity-independent - means "paused" everywhere in the report
+            { ms: item.outOfTurnMs, color: "#4fc3d9" }, // fixed, entity-independent - means "out-of-turn" everywhere
+            { ms: inTurnPlainMs, color },
+          ], Infinity); // never label the indicator row - it's a proportion signal, not a number to read
+          return `<div style="width:${colWidth}%; height:100%; display:flex;">${parts}</div>`;
+        }).join("");
+        indicatorRow = `<div style="display:flex; height:4px; margin-top:1px; border-radius:0 0 4px 4px; overflow:hidden;">${cols}</div>`;
+      }
+
+      return { mainSegs, indicatorRow };
+    }
+
+    // Same idea as buildPlayerBarRows() but for the combined GM/Monsters bar
+    // - one segment per contributing combatant, no indicator row (the GM
+    // bucket doesn't track paused/out-of-turn time the way a player does).
+    function buildGmBarSegments(gm, gmColor) {
+      const ordered = orderAndShade(gm.byEntity, () => false)
+        .map(({ item, shade }) => ({ item, color: darkenHex(gmColor, shade) }));
+      const showLabels = ordered.length > 1;
+      const parts = ordered.map(({ item, color }) => ({
+        ms: item.ms,
+        color,
+        label: showLabels ? formatDuration(Math.round(item.ms / 1000)) : null,
+      }));
+      return proportionalSegmentsHtml(parts, 12);
+    }
+
     // Shared card chrome (see hard constraint #2) - the single place the
     // inline-!important styling has to be kept correct, instead of two.
     function wrapCard({ title, subtitle, body }) {
@@ -692,36 +812,51 @@
     }
 
     function buildBarsContent() {
-      const playerEntries = perCombatantStats().map((e) => ({ ...e, icon: "🧑" }));
+      const playerEntries = perCombatantStats().map((e) => ({ ...e, icon: "🧑", kind: "player" }));
       const gm = gmTotalStats();
       const cat = categoryTotals();
       const entries = [...playerEntries];
       if (gm.totalMs > 0) {
-        entries.push({ id: "gm-total", name: "GM", icon: "🎲", color: getCombatantColor(null), totalMs: gm.totalMs, turnCount: gm.turnCount });
+        entries.push({ id: "gm-total", name: "GM", icon: "🎲", color: getCombatantColor(null), totalMs: gm.totalMs, turnCount: gm.turnCount, byEntity: gm.byEntity, kind: "gm" });
       }
       if (cat.teamMs > 0) {
-        entries.push({ id: "team-total", name: "Team", icon: "👥", color: "#383E42", totalMs: cat.teamMs, turnCount: 0 });
+        entries.push({ id: "team-total", name: "Team", icon: "👥", color: "#383E42", totalMs: cat.teamMs, turnCount: 0, kind: "flat" });
       }
       if (cat.setupMs > 0) {
-        entries.push({ id: "setup-total", name: "Setup", icon: "🛠️", color: getCombatantColor(null), totalMs: cat.setupMs, turnCount: 0 });
+        entries.push({ id: "setup-total", name: "Setup", icon: "🛠️", color: getCombatantColor(null), totalMs: cat.setupMs, turnCount: 0, kind: "flat" });
       }
       entries.sort((a, b) => b.totalMs - a.totalMs);
       const max = Math.max(1, ...entries.map((e) => e.totalMs));
+      const sessionMs = sessionTotalMs();
 
       const bars = entries.map((e) => {
         const s = Math.round(e.totalMs / 1000);
         const pct = Math.max(4, Math.round((e.totalMs / max) * 100));
-        const avg = e.turnCount > 0 ? ` · avg ${formatDuration(Math.round(s / e.turnCount))}/turn` : "";
+        const ofTotal = sessionMs > 0 ? ` · ${Math.round((e.totalMs / sessionMs) * 100)}%` : "";
+        const avg = e.turnCount > 0 ? ` · Ø ${formatDuration(Math.round(s / e.turnCount))}/turn` : "";
+
+        let fillInner, indicatorRow = "";
+        if (e.kind === "player") {
+          const built = buildPlayerBarRows(e);
+          fillInner = built.mainSegs;
+          indicatorRow = built.indicatorRow;
+        } else if (e.kind === "gm") {
+          fillInner = buildGmBarSegments(e, e.color);
+        } else {
+          fillInner = `<div style="width:100%; height:100%; background:${e.color} !important;
+                             box-shadow:inset 0 1px 0 rgba(255,255,255,0.25) !important;"></div>`;
+        }
+
         return `
           <div style="margin:6px 0;">
             <div style="display:flex; justify-content:space-between; gap:6px; font-size:11px; margin-bottom:2px; color:#eee !important;">
               <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${e.icon} ${escapeHtml(e.name)}</span>
-              <span style="flex-shrink:0; opacity:0.85; color:#eee !important;">${formatDuration(s)}${avg}</span>
+              <span style="flex-shrink:0; opacity:0.85; color:#eee !important;">${formatDuration(s)}${ofTotal}${avg}</span>
             </div>
             <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
-              <div style="width:${pct}%; height:100%; background:${e.color} !important;
-                   box-shadow:inset 0 1px 0 rgba(255,255,255,0.25) !important; border-radius:4px;"></div>
+              <div style="width:${pct}%; height:100%; display:flex;">${fillInner}</div>
             </div>
+            ${indicatorRow ? `<div style="width:${pct}%;">${indicatorRow}</div>` : ""}
           </div>`;
       }).join("");
 
@@ -741,7 +876,7 @@
           const avgTurn = e.turnCount ? Math.round(e.totalMs / e.turnCount / 1000) : 0;
           const turnCountTag = e.turnCount ? ` (${e.turnCount}×)` : "";
           const g = gaps.get(e.id);
-          const avgGap = g && g.count ? formatDuration(Math.round(g.avgMs / 1000)) : "–";
+          const avgGap = g && g.count ? `Ø ${formatDuration(Math.round(g.avgMs / 1000))}` : "–";
           const waitMs = waits.get(e.id) ?? 0;
           return `
             <div style="margin:8px 0;">
@@ -750,7 +885,7 @@
                 <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${escapeHtml(e.name)}</span>
               </div>
               <div style="display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; font-size:10px; opacity:0.8; margin-top:2px; padding-left:14px; color:#eee !important;">
-                <span style="color:#eee !important;">Turn: ${formatDuration(avgTurn)}${turnCountTag}</span>
+                <span style="color:#eee !important;">Turn: Ø ${formatDuration(avgTurn)}${turnCountTag}</span>
                 <span style="color:#eee !important;">Gap: ${avgGap}</span>
                 <span style="color:#eee !important;">Wait: ${formatDuration(Math.round(waitMs / 1000))}</span>
               </div>
@@ -1157,7 +1292,7 @@
         .sort((a, b) => b.totalMs - a.totalMs)
         .map((e) => {
           const s = Math.round(e.totalMs / 1000);
-          const avg = e.turnCount > 0 ? ` · avg ${formatDuration(Math.round(s / e.turnCount))}` : "";
+          const avg = e.turnCount > 0 ? ` · Ø ${formatDuration(Math.round(s / e.turnCount))}` : "";
           return `<div style="display:flex; align-items:center; gap:6px; padding:2px 0;">
             <span style="width:8px; height:8px; border-radius:50%; background:${e.color}; flex-shrink:0;"></span>
             <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
@@ -1171,7 +1306,7 @@
       const agg = npcAggregate();
       const cat = categoryTotals();
       panel.querySelector("#ctp-footer").innerHTML = `
-        ${agg.turns ? `👹 Monsters total: ${formatDuration(agg.totalS)} · avg ${formatDuration(agg.avgS)}/turn<br>` : ""}
+        ${agg.turns ? `👹 Monsters total: ${formatDuration(agg.totalS)} · Ø ${formatDuration(agg.avgS)}/turn<br>` : ""}
         🎲 GM: ${formatDuration(cat.dmS)} · 👥 Team: ${formatDuration(cat.teamS)} · 🛠️ Setup: ${formatDuration(cat.setupS)}
       `;
 
