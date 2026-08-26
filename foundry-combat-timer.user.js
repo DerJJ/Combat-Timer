@@ -113,6 +113,7 @@
     }
 
     const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one
+    const SHORT_PAUSE_MERGE_THRESHOLD_MS = 3000; // a pause shorter than this is noise (toggle lag, a misclick) - fold it into whatever ran right before instead of showing it as its own segment
 
     function defaultCategory(trigger, prevSegment) {
       if (trigger === "pause") {
@@ -124,11 +125,17 @@
     }
 
     function closeSegment() {
-      if (currentSegment) {
-        currentSegment.end = currentSegment.end ?? Date.now();
+      if (!currentSegment) return;
+      currentSegment.end = currentSegment.end ?? Date.now();
+      const prev = segments[segments.length - 1] ?? null;
+      if (currentSegment.trigger === "pause" && prev && segMs(currentSegment) < SHORT_PAUSE_MERGE_THRESHOLD_MS) {
+        // Too short to be a meaningful pause - absorb it into whatever was
+        // running right before instead of leaving a tiny segment behind.
+        prev.end = currentSegment.end;
+      } else {
         segments.push(currentSegment);
-        currentSegment = null;
       }
+      currentSegment = null;
     }
 
     // Single source of truth for the Segment shape - every field gets a
@@ -330,7 +337,7 @@
         if (!map.has(id)) {
           map.set(id, {
             id, name: game.users.get(id)?.name ?? "?", color: getCombatantColor(id),
-            totalMs: 0, turnCount: 0, inTurnMs: 0, outOfTurnMs: 0, byEntity: new Map(),
+            totalMs: 0, turnCount: 0, inTurnMs: 0, outOfTurnMs: 0, pausedMs: 0, byEntity: new Map(),
           });
         }
         return map.get(id);
@@ -354,6 +361,7 @@
           const e = getOwner(owner);
           const ms = segMs(seg);
           e.totalMs += ms;
+          if (seg.trigger === "pause") e.pausedMs += ms;
           if (owner === slot.designatedOwner) {
             e.inTurnMs += ms;
             getEntity(e, seg.combatantId, seg.combatantName).inTurnMs += ms;
