@@ -247,6 +247,17 @@
       if ("turn" in changed || "round" in changed) switchTurn(combat);
     });
     Hooks.on("deleteCombat", () => closeSegment());
+    Hooks.on("deleteCombatant", (combatant) => {
+      // Some modules auto-delete a combatant as soon as it's defeated (instead
+      // of just flagging it defeated and leaving it in the tracker). Treat
+      // that the same way as an already-defeated combatant: the current
+      // segment is marked defeated (excluded from every aggregate) before
+      // reconcileWithLiveState() closes it out and picks up whatever's next.
+      if (currentSegment?.combatantId === combatant.id) {
+        currentSegment.defeated = true;
+        reconcileWithLiveState();
+      }
+    });
     Hooks.on("pauseGame", (paused) => {
       if (!game.combat) return; // pausing outside of combat isn't tracked
       const active = game.combat.combatant ?? null;

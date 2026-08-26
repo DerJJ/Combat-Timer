@@ -63,6 +63,7 @@ Persisted as one JSON blob (`{ v: 1, segments, currentSegment, sessionHistory }`
 
 - `Hooks.on("combatStart" | "updateCombat" [turn/round changed])` → `switchTurn(combat)`
 - `Hooks.on("pauseGame")` → pause/unpause, but only if `game.combat` currently exists (pausing outside combat is not tracked)
+- `Hooks.on("deleteCombatant")` → if the deleted combatant is the one `currentSegment` is tracking (some modules auto-delete a combatant the moment it's defeated, instead of just flagging it and leaving it in the tracker), the segment is marked `defeated: true` *before* `reconcileWithLiveState()` closes it out — same treatment as a combatant that was already defeated when its segment was created.
 - Script (re)load → `reconcileWithLiveState()`: compares whatever was persisted against the actual live Foundry state (active combatant id + pause state). If it matches, the persisted `currentSegment` is left running untouched (including its original `start` time). If not, it's closed out and a fresh segment opened with trigger `"resume"`.
 - Manual split (✂️ button) → `splitCurrentSegment()`: closes the running segment and opens a new one with trigger `"split"`, carrying over the same technical identity and category (`combatId`/`combatantId`/`actorId`/`ownerId`/`defeated`/`category`) — a split is a continuation, not a reclassification, so it does not run back through `defaultCategory()`.
 - Manual category/player reassignment: mutates an existing segment's `category`/`overrideOwnerId` in place (no new segment created).
