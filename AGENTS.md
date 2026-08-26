@@ -35,6 +35,8 @@ The atomic unit of tracking — one contiguous slice of time with a single techn
   end: number | null,     // null while running
   trigger: "turn" | "pause" | "unpause" | "resume" | "split",
   combatId: string | null,      // Combat document id, for session-boundary detection
+  round: number | null,         // combat.round at creation time - not reconstructable later from timestamps (pauses/splits/reloads break that)
+  turnIndex: number | null,     // combat.turn at creation time (0-indexed turn-order position); Foundry rounds themselves are 1-indexed
   combatantId: string | null,   // Combatant document id
   combatantName: string,
   actorId: string | null,       // Actor document id - stable across the encounter (and across sessions), unlike combatantId; not consumed anywhere yet
@@ -65,7 +67,7 @@ Persisted as one JSON blob (`{ v: 1, segments, currentSegment, sessionHistory }`
 - `Hooks.on("pauseGame")` → pause/unpause, but only if `game.combat` currently exists (pausing outside combat is not tracked)
 - `Hooks.on("deleteCombatant")` → if the deleted combatant is the one `currentSegment` is tracking (some modules auto-delete a combatant the moment it's defeated, instead of just flagging it and leaving it in the tracker), the segment is marked `defeated: true` *before* `reconcileWithLiveState()` closes it out — same treatment as a combatant that was already defeated when its segment was created.
 - Script (re)load → `reconcileWithLiveState()`: compares whatever was persisted against the actual live Foundry state (active combatant id + pause state). If it matches, the persisted `currentSegment` is left running untouched (including its original `start` time). If not, it's closed out and a fresh segment opened with trigger `"resume"`.
-- Manual split (✂️ button) → `splitCurrentSegment()`: closes the running segment and opens a new one with trigger `"split"`, carrying over the same technical identity and category (`combatId`/`combatantId`/`actorId`/`ownerId`/`defeated`/`category`) — a split is a continuation, not a reclassification, so it does not run back through `defaultCategory()`.
+- Manual split (✂️ button) → `splitCurrentSegment()`: closes the running segment and opens a new one with trigger `"split"`, carrying over the same technical identity and category (`combatId`/`round`/`turnIndex`/`combatantId`/`actorId`/`ownerId`/`defeated`/`category`) — a split is a continuation, not a reclassification, so it does not run back through `defaultCategory()`.
 - Manual category/player reassignment: mutates an existing segment's `category`/`overrideOwnerId` in place (no new segment created).
 
 Only triggers `"turn"` and `"resume"` mark a genuinely new turn boundary (see `isTurnStart()` in Timing statistics) — never `"pause"`, `"unpause"`, or `"split"`, since those are continuations of an already-counted turn rather than new ones. `"resume"` counts because, by construction, `reconcileWithLiveState()` only ever creates one when live state does *not* match what was persisted — meaning it always represents either a genuinely new turn discovered after a reload, or a turn change missed while reloading. Either way it hasn't been counted anywhere else.

@@ -131,7 +131,7 @@
       }
     }
 
-    function openSegment(trigger, combatant, combatId = null) {
+    function openSegment(trigger, combatant, combat = null) {
       const prev = segments[segments.length - 1] ?? null;
       const ownerId = getOwningPlayerId(combatant?.actor);
       currentSegment = {
@@ -139,7 +139,9 @@
         start: Date.now(),
         end: null,
         trigger, // "turn" | "pause" | "unpause" | "resume" | "split"
-        combatId, // which Combat document this belongs to - used to detect a genuinely new encounter
+        combatId: combat?.id ?? null, // which Combat document this belongs to - used to detect a genuinely new encounter
+        round: combat?.round ?? null, // only known at creation time - can't be reconstructed later from timestamps alone
+        turnIndex: combat?.turn ?? null,
         combatantId: combatant?.id ?? null,
         combatantName: combatant?.name ?? combatant?.token?.name ?? "–",
         actorId: combatant?.actor?.id ?? null, // stable across the encounter (and across sessions), unlike combatantId
@@ -160,6 +162,8 @@
       if (!currentSegment) return;
       const carryOver = {
         combatId: currentSegment.combatId,
+        round: currentSegment.round,
+        turnIndex: currentSegment.turnIndex,
         combatantId: currentSegment.combatantId,
         combatantName: currentSegment.combatantName,
         actorId: currentSegment.actorId,
@@ -197,9 +201,9 @@
       }
       if (!liveCombat) return; // no combat -> track nothing, currentSegment stays null
       if (livePaused) {
-        openSegment("pause", liveCombatant, liveCombat.id);
+        openSegment("pause", liveCombatant, liveCombat);
       } else if (liveCombatant) {
-        openSegment("resume", liveCombatant, liveCombat.id);
+        openSegment("resume", liveCombatant, liveCombat);
       }
     }
     reconcileWithLiveState();
@@ -239,7 +243,7 @@
         archiveSessionIfNeeded();
       }
       closeSegment();
-      openSegment("turn", combat?.combatant ?? null, newCombatId);
+      openSegment("turn", combat?.combatant ?? null, combat);
     }
 
     Hooks.on("combatStart", (combat) => switchTurn(combat));
@@ -262,7 +266,7 @@
       if (!game.combat) return; // pausing outside of combat isn't tracked
       const active = game.combat.combatant ?? null;
       closeSegment();
-      openSegment(paused ? "pause" : "unpause", active, game.combat.id);
+      openSegment(paused ? "pause" : "unpause", active, game.combat);
     });
 
     // ---- Derived stats (always for the SELECTED session) ----
@@ -524,12 +528,13 @@
       const out = [];
       let t = Date.now() - 15 * 60 * 1000;
       for (let round = 0; round < 3; round++) {
-        for (const entry of order) {
+        for (const [turnIndex, entry] of order.entries()) {
           const isPC = !!entry.ownerId;
           const dur = randomTurnDurationMs();
           out.push({
             id: uid(), start: t, end: t + dur, trigger: "turn",
             combatantId: `dummy-${entry.name}`, combatantName: entry.name,
+            round: round + 1, turnIndex, // Foundry rounds are 1-indexed, turn index is 0-indexed
             ownerId: entry.ownerId ?? null,
             defeated: !isPC && round === 2 && entry.name === "Goblin A",
             category: "player",
@@ -540,6 +545,7 @@
             out.push({
               id: uid(), start: t, end: t + pauseDur, trigger: "pause",
               combatantId: `dummy-${entry.name}`, combatantName: entry.name,
+              round: round + 1, turnIndex,
               ownerId: entry.ownerId ?? null,
               defeated: false,
               category: Math.random() < 0.5 ? "setup" : "player",
