@@ -718,6 +718,66 @@
       persist();
     }
 
+    // Exports only the currently VIEWED session (whichever tab is selected),
+    // not the full ring buffer - matches "what you're looking at" rather than
+    // requiring a full-state restore just to move one session elsewhere.
+    function exportSelectedSession() {
+      const { segs, current } = getSelectedSessionData();
+      const idx = selectedSession === "prev1" ? 0 : selectedSession === "prev2" ? 1 : null;
+      const payload = {
+        exportedAt: Date.now(),
+        world: game.world?.id ?? null,
+        session: selectedSession, // "current" | "prev1" | "prev2" - informational, doesn't constrain re-import
+        endedAt: idx !== null ? (sessionHistory[idx]?.endedAt ?? null) : null,
+        segments: segs,
+        currentSegment: current,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      a.href = url;
+      a.download = `combat-timer-${game.world?.id ?? "world"}-${selectedSession}-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    // Replaces whichever session is currently viewed with the imported file's
+    // data outright - no archiving of what was there before, matching export
+    // being scoped to "just the viewed session" rather than the full state.
+    function importSessionFromFile(file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        let parsed;
+        try {
+          parsed = JSON.parse(reader.result);
+        } catch (e) {
+          alert("That file isn't valid JSON.");
+          return;
+        }
+        if (!Array.isArray(parsed.segments)) {
+          alert("That file doesn't look like Combat Timer session data (missing a segments array).");
+          return;
+        }
+        const label = selectedSession === "current" ? "current (Now)" : selectedSession === "prev1" ? "-1" : "-2";
+        if (!confirm(`Replace the "${label}" tab's data with the imported file? This cannot be undone.`)) return;
+
+        if (selectedSession === "current") {
+          segments = parsed.segments;
+          currentSegment = parsed.currentSegment ?? null;
+          reconcileWithLiveState(); // imported data may not match what's actually live right now
+        } else {
+          const idx = selectedSession === "prev1" ? 0 : 1;
+          sessionHistory[idx] = { segments: parsed.segments, endedAt: parsed.endedAt ?? Date.now() };
+        }
+        persist();
+        renderPanel();
+      };
+      reader.readAsText(file);
+    }
+
     async function postToChat(content, kind) {
       await ChatMessage.create({
         content,
@@ -779,6 +839,15 @@
         <div id="ctp-segments" style="max-height:170px; overflow-y:auto; padding:2px 10px 6px;"></div>
         <div id="ctp-toolbar" style="display:flex; gap:4px; padding:6px 10px;
              border-top:1px solid #3a3a46; border-bottom:1px solid #3a3a46; font-size:10px;"></div>
+        <div id="ctp-io" style="display:flex; gap:4px; padding:4px 10px; font-size:10px;">
+          <span data-action="export" title="Export the currently viewed session (Now / -1 / -2) as a JSON file"
+                style="flex:1; text-align:center; cursor:pointer; padding:3px 2px; border-radius:4px;
+                       opacity:0.6; border:1px solid #3a3a46;">📤 Export</span>
+          <span data-action="import" title="Import a JSON file, replacing the currently viewed session"
+                style="flex:1; text-align:center; cursor:pointer; padding:3px 2px; border-radius:4px;
+                       opacity:0.6; border:1px solid #3a3a46;">📥 Import</span>
+          <input type="file" id="ctp-import-file" accept="application/json" style="display:none;">
+        </div>
         <div style="padding:6px 10px; display:flex; flex-direction:column; gap:4px;">
           <button id="ctp-post-bars" style="padding:5px; border:none; border-radius:6px;
                   background:#4b3fa0; color:#fff; cursor:pointer; font-size:11px;">
@@ -797,6 +866,13 @@
       el.querySelector("#ctp-reset").addEventListener("click", () => deleteSelectedSession());
       el.querySelector("#ctp-post-bars").addEventListener("click", () => postToChat(buildBarsContent(), "bars"));
       el.querySelector("#ctp-post-players").addEventListener("click", () => postToChat(buildPlayerListContent(), "players"));
+      el.querySelector('#ctp-io [data-action="export"]').addEventListener("click", () => exportSelectedSession());
+      el.querySelector('#ctp-io [data-action="import"]').addEventListener("click", () => el.querySelector("#ctp-import-file").click());
+      el.querySelector("#ctp-import-file").addEventListener("change", (ev) => {
+        const file = ev.target.files[0];
+        ev.target.value = ""; // allow re-selecting the same file later
+        if (file) importSessionFromFile(file);
+      });
 
       el.querySelector("#ctp-header").addEventListener("mousedown", (ev) => {
         const rect = el.getBoundingClientRect();
@@ -831,6 +907,7 @@
         #combat-timer-panel #ctp-close,
         #combat-timer-panel #ctp-toolbar [data-action="split"],
         #combat-timer-panel #ctp-toolbar [data-session],
+        #combat-timer-panel #ctp-io [data-action],
         #combat-timer-panel #ctp-segments [data-cat],
         #combat-timer-panel #ctp-segments [data-owner-pick],
         #combat-timer-panel #ctp-post-bars,
@@ -846,7 +923,8 @@
           border-radius: 4px;
         }
         #combat-timer-panel #ctp-toolbar [data-action="split"]:hover,
-        #combat-timer-panel #ctp-toolbar [data-session][data-available="true"]:hover {
+        #combat-timer-panel #ctp-toolbar [data-session][data-available="true"]:hover,
+        #combat-timer-panel #ctp-io [data-action]:hover {
           opacity: 1 !important;
           background: rgba(255,255,255,0.12);
         }
