@@ -155,6 +155,7 @@
         combatantId: null,
         combatantName: "–",
         actorId: null, // stable across the encounter (and across sessions), unlike combatantId
+        actorType: null, // combatant.actor.type ("character" vs "npc" in dnd5e/pf2e) - distinguishes a PC from a player-owned summon/pet, which "ownerId !== null" alone can't
         ownerId: null,
         overrideOwnerId: null, // manual reassignment to a specific player, wins over ownerId
         defeated: false,
@@ -174,6 +175,7 @@
         combatantId: combatant?.id ?? null,
         combatantName: combatant?.name ?? combatant?.token?.name ?? "–",
         actorId: combatant?.actor?.id ?? null,
+        actorType: combatant?.actor?.type ?? null,
         ownerId,
         defeated: combatant?.isDefeated ?? false,
         category: defaultCategory(trigger, prev),
@@ -313,16 +315,44 @@
       return allSegments().find((s) => s.id === id) ?? null;
     }
 
-    // Single source of truth for "does this segment count at all" and "who
-    // does its time belong to" - used by every aggregate below (see AGENTS.md).
-    function isTracked(seg) {
-      return !seg.defeated && !!seg.combatantId;
+    // Single source of truth for "does this segment have real combat context
+    // at all" - used by every aggregate below (see AGENTS.md).
+    function hasCombatContext(seg) {
+      return !!seg.combatantId;
     }
     function resolvedOwner(seg) {
       return seg.overrideOwnerId ?? seg.ownerId ?? null;
     }
     function isPlayerControlled(seg) {
       return resolvedOwner(seg) !== null;
+    }
+    // A defeated PC still gets a real turn (death saves etc. are genuine
+    // activity); a defeated NPC's turn is an instant skip - nobody actually
+    // decided anything, so it never counts as "a turn" for averaging,
+    // regardless of who its time ends up credited to (see effectiveOwner()).
+    function isRealTurn(seg) {
+      return hasCombatContext(seg) && (!seg.defeated || seg.actorType === "character");
+    }
+    // For each combatantId, who resolvedOwner() credited its most recent real
+    // (non-instant-skip) turn to. Recomputed fresh every time - not cached -
+    // so it always reflects the latest known ownership, including a manual
+    // reassignment made after the fact via the player picker.
+    function lastLiveOwnerByCombatant() {
+      const map = new Map();
+      for (const seg of allSegments()) {
+        if (isRealTurn(seg)) map.set(seg.combatantId, resolvedOwner(seg));
+      }
+      return map;
+    }
+    // Like resolvedOwner(), but a defeated NPC's instant-skip inherits
+    // whoever owned its last real turn (possibly nobody, i.e. the GM/Monsters
+    // bucket) instead of always reading as unclaimed - this is what stops
+    // that time from silently vanishing from every total (see S-01).
+    function effectiveOwner(seg, lastLiveOwner) {
+      if (seg.overrideOwnerId) return seg.overrideOwnerId;
+      if (seg.ownerId) return seg.ownerId;
+      if (seg.defeated) return lastLiveOwner.get(seg.combatantId) ?? null;
+      return null;
     }
 
     // One player's turn/entity-time breakdown. "In-turn" = time during a slot
@@ -347,16 +377,17 @@
         return owner.byEntity.get(combatantId);
       };
 
+      const lastLiveOwner = lastLiveOwnerByCombatant();
       for (const slot of buildTurnSlots()) {
         const opening = slot.segments[0];
-        if (slot.designatedOwner && opening.category === "player" && isTracked(opening)) {
+        if (slot.designatedOwner && opening.category === "player" && isRealTurn(opening)) {
           const owner = getOwner(slot.designatedOwner);
           owner.turnCount += 1;
           getEntity(owner, opening.combatantId, opening.combatantName).turnCount += 1;
         }
         for (const seg of slot.segments) {
-          if (seg.category !== "player" || !isTracked(seg)) continue;
-          const owner = resolvedOwner(seg);
+          if (seg.category !== "player" || !hasCombatContext(seg)) continue;
+          const owner = effectiveOwner(seg, lastLiveOwner);
           if (!owner) continue; // unclaimed NPC turn -> npcAggregate/gmTotalStats instead
           const e = getOwner(owner);
           const ms = segMs(seg);
@@ -375,10 +406,12 @@
 
     function npcAggregate() {
       let totalMs = 0, turns = 0;
+      const lastLiveOwner = lastLiveOwnerByCombatant();
       for (const seg of allSegments()) {
-        if (seg.category !== "player" || isPlayerControlled(seg) || !isTracked(seg)) continue;
+        if (seg.category !== "player" || !hasCombatContext(seg)) continue;
+        if (effectiveOwner(seg, lastLiveOwner) !== null) continue; // claimed by someone -> perCombatantStats/gmTotalStats("dm") instead
         totalMs += segMs(seg);
-        if (seg.trigger === "turn" || seg.trigger === "resume") turns += 1;
+        if (isRealTurn(seg)) turns += 1; // an instant-skip's brief duration still counts toward totalMs, but never masquerades as "a turn"
       }
       return { totalS: Math.round(totalMs / 1000), turns, avgS: turns ? Math.round(totalMs / turns / 1000) : 0 };
     }
@@ -457,7 +490,7 @@
     function absoluteWaitStats() {
       let spanStart = null, spanEnd = null, teamMs = 0;
       for (const seg of allSegments()) {
-        if (!isTracked(seg)) continue;
+        if (!hasCombatContext(seg)) continue;
         const end = seg.end ?? Date.now();
         if (spanStart === null || seg.start < spanStart) spanStart = seg.start;
         if (spanEnd === null || end > spanEnd) spanEnd = end;
@@ -466,10 +499,11 @@
       if (spanStart === null) return new Map();
       const span = Math.max(0, (spanEnd - spanStart) - teamMs);
 
+      const lastLiveOwner = lastLiveOwnerByCombatant();
       const activeMs = new Map();
       for (const seg of allSegments()) {
-        if (seg.category !== "player" || !isTracked(seg)) continue;
-        const owner = resolvedOwner(seg);
+        if (seg.category !== "player" || !hasCombatContext(seg)) continue;
+        const owner = effectiveOwner(seg, lastLiveOwner);
         if (!owner) continue;
         activeMs.set(owner, (activeMs.get(owner) ?? 0) + segMs(seg));
       }
@@ -549,12 +583,13 @@
       for (let round = 0; round < 3; round++) {
         for (const [turnIndex, entry] of order.entries()) {
           const isPC = !!entry.ownerId;
+          const actorType = isPC ? "character" : "npc";
           const dur = randomTurnDurationMs();
           out.push(makeSegment({
             start: t, end: t + dur, trigger: "turn",
             combatantId: `dummy-${entry.name}`, combatantName: entry.name,
             round: round + 1, turnIndex, // Foundry rounds are 1-indexed, turn index is 0-indexed
-            ownerId: entry.ownerId ?? null,
+            ownerId: entry.ownerId ?? null, actorType,
             defeated: !isPC && round === 2 && entry.name === "Goblin A",
           }));
           t += dur;
@@ -564,7 +599,7 @@
               start: t, end: t + pauseDur, trigger: "pause",
               combatantId: `dummy-${entry.name}`, combatantName: entry.name,
               round: round + 1, turnIndex,
-              ownerId: entry.ownerId ?? null,
+              ownerId: entry.ownerId ?? null, actorType,
               category: Math.random() < 0.5 ? "setup" : "player",
             }));
             t += pauseDur;
@@ -593,13 +628,14 @@
     // pause that was really the GM's time, not the player's).
     function gmTotalStats() {
       let ms = 0, turns = 0;
+      const lastLiveOwner = lastLiveOwnerByCombatant();
       for (const seg of allSegments()) {
-        if (!isTracked(seg)) continue;
-        const unclaimedNpcTurn = seg.category === "player" && !isPlayerControlled(seg);
+        if (!hasCombatContext(seg)) continue;
+        const unclaimedNpcTurn = seg.category === "player" && effectiveOwner(seg, lastLiveOwner) === null;
         const countsForGM = unclaimedNpcTurn || seg.category === "dm";
         if (!countsForGM) continue;
         ms += segMs(seg);
-        if (seg.trigger === "turn" || seg.trigger === "resume") turns += 1;
+        if (isRealTurn(seg)) turns += 1;
       }
       return { totalMs: ms, turnCount: turns };
     }

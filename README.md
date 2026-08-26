@@ -11,7 +11,7 @@ A Tampermonkey userscript for [Foundry VTT](https://foundryvtt.com/) that tracks
 - Separates real "thinking time" from time spent paused, and from setup/administrative overhead.
 - Lets you re-categorize any slice of time after the fact: attribute it to a **Player**, the **GM**, the **Team** (shared/group time), or **Setup** (overhead) — including handing a slice to a *different* player than whoever's turn it technically was (e.g. an Attack of Opportunity).
 - Merges multiple combatants belonging to the same player (a character plus their familiar/summon) into one entry.
-- Automatically excludes turns from already-defeated monsters, so instantly-skipped dead combatants don't skew the averages.
+- An instantly-skipped dead monster's turn never skews anyone's average turn length, but its time isn't lost either — it's credited to whoever the monster's turns were last attributed to (a specific player if it had been reassigned, otherwise the GM). A defeated player character still gets a normal turn (death saves and the like are real activity), counted exactly like any other turn.
 - Uses each player's own Foundry-configured color for a consistent look.
 - Posts two kinds of chat report — a bar chart of time per person, and a player overview with average turn length, average gap between turns, and total wait time. Both render identically for everyone in chat, whether or not they have this script installed.
 - Keeps a short history: the current combat plus the last 2 finished ones, switchable via tabs, so you don't lose data when a new fight starts.
