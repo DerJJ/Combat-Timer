@@ -629,9 +629,9 @@
         const avg = e.turnCount > 0 ? ` · avg ${formatDuration(Math.round(s / e.turnCount))}/turn` : "";
         return `
           <div style="margin:6px 0;">
-            <div style="display:flex; justify-content:space-between; font-size:11px; margin-bottom:2px; color:#eee !important;">
-              <span style="color:#eee !important;">${e.icon} ${escapeHtml(e.name)}</span>
-              <span style="opacity:0.85; color:#eee !important;">${formatDuration(s)}${avg}</span>
+            <div style="display:flex; justify-content:space-between; gap:6px; font-size:11px; margin-bottom:2px; color:#eee !important;">
+              <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${e.icon} ${escapeHtml(e.name)}</span>
+              <span style="flex-shrink:0; opacity:0.85; color:#eee !important;">${formatDuration(s)}${avg}</span>
             </div>
             <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
               <div style="width:${pct}%; height:100%; background:${e.color} !important;
@@ -662,9 +662,9 @@
             <div style="margin:8px 0;">
               <div style="display:flex; align-items:center; gap:6px; font-weight:600; color:#eee !important;">
                 <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:${e.color} !important; flex-shrink:0;"></span>
-                <span style="color:#eee !important;">${escapeHtml(e.name)}</span>
+                <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${escapeHtml(e.name)}</span>
               </div>
-              <div style="display:flex; justify-content:space-between; gap:8px; font-size:10px; opacity:0.8; margin-top:2px; padding-left:14px; color:#eee !important;">
+              <div style="display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; font-size:10px; opacity:0.8; margin-top:2px; padding-left:14px; color:#eee !important;">
                 <span style="color:#eee !important;">Turn: ${formatDuration(avgTurn)}${turnCountTag}</span>
                 <span style="color:#eee !important;">Gap: ${avgGap}</span>
                 <span style="color:#eee !important;">Wait: ${formatDuration(Math.round(waitMs / 1000))}</span>
