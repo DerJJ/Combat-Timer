@@ -672,10 +672,14 @@
             </div>`;
         }).join("");
 
+      const legend = rows
+        ? `<div style="font-size:9px; opacity:0.45; margin-top:6px; color:#eee !important;">Ø turn length · Ø gap between PC turns · total time waiting</div>`
+        : "";
+
       return wrapCard({
         title: "🧑 Player Overview",
         subtitle: `Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}`,
-        body: rows,
+        body: rows + legend,
       });
     }
 
