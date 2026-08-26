@@ -43,6 +43,7 @@
       dm:     { icon: "🎲" },
       team:   { icon: "👥" },
       setup:  { icon: "🛠️" },
+      ignore: { icon: "🚫" }, // manual-only (never auto-assigned) - excluded from every total, for a segment that's really just a wall-clock gap (e.g. the session resumed days later)
     };
 
     // ---- Persistence ----
@@ -443,14 +444,23 @@
     }
     function buildTurnSlots() {
       const slots = [];
+      let afterIgnored = false;
       for (const seg of allSegments()) {
-        if (!slots.length || isTurnStart(seg)) {
+        if (seg.category === "ignore") {
+          // A wall-clock gap someone manually marked as not real time (e.g.
+          // the session resumed days later) - never becomes part of any
+          // slot, and never lets one slot span across it either.
+          afterIgnored = true;
+          continue;
+        }
+        if (!slots.length || isTurnStart(seg) || afterIgnored) {
           slots.push({ designatedOwner: seg.ownerId ?? null, start: seg.start, end: seg.end ?? Date.now(), segments: [seg] });
         } else {
           const slot = slots[slots.length - 1];
           slot.end = seg.end ?? Date.now();
           slot.segments.push(seg);
         }
+        afterIgnored = false;
       }
       return slots;
     }
@@ -488,16 +498,17 @@
     // itself, so shared/group time is invisible to individual wait entirely
     // (it only shows up via the GM/Team category totals).
     function absoluteWaitStats() {
-      let spanStart = null, spanEnd = null, teamMs = 0;
+      let spanStart = null, spanEnd = null, teamMs = 0, ignoredMs = 0;
       for (const seg of allSegments()) {
         if (!hasCombatContext(seg)) continue;
         const end = seg.end ?? Date.now();
         if (spanStart === null || seg.start < spanStart) spanStart = seg.start;
         if (spanEnd === null || end > spanEnd) spanEnd = end;
         if (seg.category === "team") teamMs += segMs(seg);
+        if (seg.category === "ignore") ignoredMs += segMs(seg);
       }
       if (spanStart === null) return new Map();
-      const span = Math.max(0, (spanEnd - spanStart) - teamMs);
+      const span = Math.max(0, (spanEnd - spanStart) - teamMs - ignoredMs);
 
       const lastLiveOwner = lastLiveOwnerByCombatant();
       const activeMs = new Map();
@@ -519,7 +530,11 @@
       if (!segs.length) return 0;
       const start = Math.min(...segs.map((s) => s.start));
       const end = Math.max(...segs.map((s) => s.end ?? Date.now()));
-      return end - start;
+      // Excluding an "ignore" segment from the min/max above wouldn't shrink
+      // the span by itself - segments before and after it still anchor the
+      // same start/end. Its duration has to be explicitly subtracted instead.
+      const ignoredMs = segs.filter((s) => s.category === "ignore").reduce((sum, s) => sum + segMs(s), 0);
+      return Math.max(0, (end - start) - ignoredMs);
     }
 
     // ---- Dummy data (only if the current session is empty) ----

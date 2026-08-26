@@ -52,7 +52,7 @@ The panel opens automatically. If you close it (✕), a small reopen button appe
 - **Session tabs** (🟢 Now / 📦 -1 / 📦 -2): switch which session's data is shown and posted to chat. Greyed-out tabs have no data yet.
 - **✂️**: splits the currently running segment right now, e.g. to carve out a reaction or interrupt mid-turn so it can be categorized separately.
 - **📤 Export / 📥 Import**: save whichever session tab (Now / -1 / -2) you're currently viewing to a JSON file, or load one back in. Import replaces that tab's data outright — there's a confirmation prompt, but no undo, so export first if you're unsure. Handy for backing up a session, or moving one to a different browser/computer.
-- **Segment list**: every tracked slice of time, each with four small icons (🧑 Player / 🎲 GM / 👥 Team / 🛠️ Setup) to change its category. Tapping 🧑 opens a picker so you can assign that time to *any* player, not just whoever's turn it technically was.
+- **Segment list**: every tracked slice of time, each with five small icons (🧑 Player / 🎲 GM / 👥 Team / 🛠️ Setup / 🚫 Ignore) to change its category. Tapping 🧑 opens a picker so you can assign that time to *any* player, not just whoever's turn it technically was. **🚫 Ignore** excludes a slice from every total and every player's stats entirely — for when the session picks back up days later and a segment ends up spanning that whole real-world gap: split it off with ✂️ first, then mark the now-closed, days-long segment 🚫.
 
 ### Chat reports
 
