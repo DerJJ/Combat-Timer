@@ -52,7 +52,10 @@
 
     // Team and Setup are categories, not people. Setup used to reuse the GM's
     // color (getCombatantColor(null)), which made two adjacent bars in the same
-    // chat report identical and unidentifiable.
+    // chat report identical and unidentifiable. Team stays genuinely
+    // person-independent (shared/group time); Setup is DM-only by definition
+    // (see defaultCategory()/categoryPickerHTML()) but keeps its own row and
+    // color rather than folding into the GM bar, for that same legibility reason.
     const TEAM_COLOR = "#383E42";
     const SETUP_COLOR = "#6b6f74";
 
@@ -60,25 +63,9 @@
     function storageKey() {
       return `ctp-state-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
-    // Pre-user-scoping data lived under this key (no user id suffix). Only
-    // read as a fallback, never written to - the next persist() tick writes
-    // the adopted data forward under storageKey(), self-healing the migration.
-    function legacyStorageKey() {
-      return `ctp-state-${game.world?.id ?? "default"}`;
-    }
-    function hasPersistedData(state) {
-      return !!state && (state.segments?.length > 0 || !!state.currentSegment || state.sessionHistory?.length > 0);
-    }
     function loadPersisted() {
       try {
-        const current = JSON.parse(localStorage.getItem(storageKey()) ?? "null");
-        if (hasPersistedData(current)) return current;
-        // Nothing (or only an empty state already written by a prior run of
-        // this script) under the current key - fall back to whatever the
-        // pre-user-scoping key holds, so an empty write doesn't permanently
-        // block the one-time migration.
-        const legacy = JSON.parse(localStorage.getItem(legacyStorageKey()) ?? "null");
-        return hasPersistedData(legacy) ? legacy : current;
+        return JSON.parse(localStorage.getItem(storageKey()) ?? "null");
       } catch (e) {
         console.warn("Combat Timer: could not load saved state", e);
         return null;
@@ -126,11 +113,19 @@
     const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one
     const SHORT_PAUSE_MERGE_THRESHOLD_MS = 3000; // a pause shorter than this is noise (toggle lag, a misclick) - fold it into whatever ran right before instead of showing it as its own segment
 
-    function defaultCategory(trigger, prevSegment) {
+    // Setup is a DM-only category (see CATEGORY_META) - a segment with a
+    // player owner can never default to, or inherit, "setup".
+    function defaultCategory(trigger, prevSegment, ownerId) {
       if (trigger === "pause") {
+        const dmOwned = !ownerId;
         const prevDur = prevSegment ? segMs(prevSegment) : Infinity;
-        if (prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
-        return prevSegment ? prevSegment.category : "setup";
+        if (dmOwned && prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
+        // "ignore" is manual-only (see CATEGORY_META) - a live pause is real
+        // time and must never silently inherit it from the segment before.
+        if (prevSegment && prevSegment.category !== "ignore" && (dmOwned || prevSegment.category !== "setup")) {
+          return prevSegment.category;
+        }
+        return dmOwned ? "setup" : "player";
       }
       return "player";
     }
@@ -189,7 +184,7 @@
         actorType: combatant?.actor?.type ?? null,
         ownerId,
         defeated: combatant?.isDefeated ?? false,
-        category: defaultCategory(trigger, prev),
+        category: defaultCategory(trigger, prev, ownerId),
       });
     }
 
@@ -225,11 +220,12 @@
       if (currentSegment && currentSegment.combatantId === liveCombatantId && currentIsPause === livePaused) {
         return;
       }
-      if (currentSegment) {
-        currentSegment.end = currentSegment.end ?? Date.now();
-        segments.push(currentSegment);
-        currentSegment = null;
-      }
+      // Same short-pause merge as every other close path - the threshold is
+      // judged purely on the pause segment's own wall-clock duration, which is
+      // exactly as meaningful whether it's being closed live or caught here
+      // (e.g. right after a page reload), so a brief pause doesn't survive as
+      // its own tiny segment just because of which path happened to close it.
+      closeSegment();
       if (!liveCombat) return; // no combat -> track nothing, currentSegment stays null
       if (livePaused) {
         openSegment("pause", liveCombatant, liveCombat);
@@ -400,7 +396,7 @@
       const lastLiveOwner = lastLiveOwnerByCombatant();
       for (const slot of buildTurnSlots()) {
         const opening = slot.segments[0];
-        if (slot.designatedOwner && opening.category === "player" && isRealTurn(opening)) {
+        if (slot.designatedOwner && opening.category === "player" && isRealTurn(opening) && isTurnStart(opening)) {
           const owner = getOwner(slot.designatedOwner);
           owner.turnCount += 1;
           getEntity(owner, opening).turnCount += 1;
@@ -433,11 +429,17 @@
         if (seg.category !== "player" || !hasCombatContext(seg)) continue;
         if (effectiveOwner(seg, lastLiveOwner) !== null) continue; // claimed by someone -> perCombatantStats/gmTotalStats("dm") instead
         totalMs += segMs(seg);
-        if (isRealTurn(seg)) turns += 1; // an instant-skip's brief duration still counts toward totalMs, but never masquerades as "a turn"
+        // isTurnStart() too - see gmTotalStats() - so a pause/unpause/split
+        // inside one monster's turn doesn't count as several turns.
+        if (isRealTurn(seg) && isTurnStart(seg)) turns += 1; // an instant-skip's brief duration still counts toward totalMs, but never masquerades as "a turn"
       }
       return { totalS: Math.round(totalMs / 1000), turns, avgS: turns ? Math.round(totalMs / turns / 1000) : 0 };
     }
 
+    // Deliberately does not gate on hasCombatContext() like the other
+    // aggregates - dm/team/setup time commonly has no combatantId at all
+    // (pre-combat prep, between-encounter housekeeping), and that's exactly
+    // the time these categories exist to capture, not an edge case to drop.
     function categoryTotals() {
       const t = { dm: 0, team: 0, setup: 0 };
       for (const seg of allSegments()) if (seg.category in t) t[seg.category] += segMs(seg);
@@ -494,7 +496,7 @@
         // ownerId regardless of category - a stray "setup" blip (e.g. a
         // tracker mis-click) still carries a real player's id and would
         // otherwise slice one genuine gap into two much smaller fake ones.
-        if (!s.designatedOwner || s.segments[0].category !== "player" || !isRealTurn(s.segments[0])) continue;
+        if (!s.designatedOwner || s.segments[0].category !== "player" || !isRealTurn(s.segments[0]) || !isTurnStart(s.segments[0])) continue;
         if (!byOwner.has(s.designatedOwner)) byOwner.set(s.designatedOwner, []);
         byOwner.get(s.designatedOwner).push(s);
       }
@@ -640,7 +642,7 @@
               combatantId: `dummy-${entry.name}`, combatantName: entry.name,
               round: round + 1, turnIndex,
               ownerId: entry.ownerId ?? null, actorType,
-              category: Math.random() < 0.5 ? "setup" : "player",
+              category: !entry.ownerId && Math.random() < 0.5 ? "setup" : "player",
             }));
             t += pauseDur;
           }
@@ -672,8 +674,9 @@
       const byEntity = new Map();
       const lastLiveOwner = lastLiveOwnerByCombatant();
       for (const seg of allSegments()) {
-        if (!hasCombatContext(seg)) continue;
-        const unclaimedNpcTurn = seg.category === "player" && effectiveOwner(seg, lastLiveOwner) === null;
+        // A DM-direct segment ("dm" category) has no combatant by nature -
+        // hasCombatContext() only gates the indirect (unclaimed-monster) path.
+        const unclaimedNpcTurn = hasCombatContext(seg) && seg.category === "player" && effectiveOwner(seg, lastLiveOwner) === null;
         const countsForGM = unclaimedNpcTurn || seg.category === "dm";
         if (!countsForGM) continue;
         const segDurMs = segMs(seg);
@@ -683,7 +686,10 @@
         }
         const entity = byEntity.get(seg.combatantId);
         entity.ms += segDurMs;
-        if (isRealTurn(seg)) { turns += 1; entity.turnCount += 1; }
+        // isRealTurn() alone answers "does this count as real activity", not
+        // "does this open a turn" - without isTurnStart() too, a monster
+        // turn's own pause/unpause/split segments would each count again.
+        if (isRealTurn(seg) && isTurnStart(seg)) { turns += 1; entity.turnCount += 1; }
       }
       return { totalMs: ms, turnCount: turns, byEntity: [...byEntity.values()] };
     }
@@ -827,10 +833,15 @@
           if (entMs <= 0) return "";
           const colWidth = (entMs / personTotalMs) * 100;
           const pausedMs = Math.min(item.pausedMs, entMs);
-          const inTurnPlainMs = Math.max(0, entMs - pausedMs - item.outOfTurnMs);
+          // A segment that's both paused and reassigned out-of-turn would
+          // otherwise get counted in both buckets. Paused wins - it describes
+          // what the time WAS, while out-of-turn describes who it's charged
+          // to - so the overlap is drawn from the out-of-turn bucket first.
+          const outOfTurnMs = Math.max(0, item.outOfTurnMs - pausedMs);
+          const inTurnPlainMs = Math.max(0, entMs - pausedMs - outOfTurnMs);
           const parts = proportionalSegmentsHtml([
             { ms: pausedMs, color: "#e8a33d" }, // fixed, entity-independent - means "paused" everywhere in the report
-            { ms: item.outOfTurnMs, color: "#4fc3d9" }, // fixed, entity-independent - means "out-of-turn" everywhere
+            { ms: outOfTurnMs, color: "#4fc3d9" }, // fixed, entity-independent - means "out-of-turn" everywhere
             { ms: inTurnPlainMs, color },
           ], Infinity); // never label the indicator row - it's a proportion signal, not a number to read
           return `<div style="width:${colWidth}%; height:100%; display:flex;">${parts}</div>`;
@@ -886,7 +897,7 @@
         const s = Math.round(e.totalMs / 1000);
         const pct = Math.max(4, Math.round((e.totalMs / max) * 100));
         const ofTotal = sessionMs > 0 ? ` · ${Math.round((e.totalMs / sessionMs) * 100)}%` : "";
-        const avg = e.turnCount > 0 ? ` · Ø ${formatDuration(Math.round(s / e.turnCount))}/turn` : "";
+        const avg = e.turnCount > 0 ? ` · Ø ${formatDuration(Math.round(e.inTurnMs / e.turnCount / 1000))}/turn` : "";
 
         let fillInner, indicatorRow = "";
         if (e.kind === "player") {
@@ -938,7 +949,7 @@
       const rows = perCombatantStats()
         .sort((a, b) => b.totalMs - a.totalMs)
         .map((e) => {
-          const avgTurn = e.turnCount ? Math.round(e.totalMs / e.turnCount / 1000) : 0;
+          const avgTurn = e.turnCount ? Math.round(e.inTurnMs / e.turnCount / 1000) : 0;
           const turnCountTag = e.turnCount ? ` (${e.turnCount}×)` : "";
           const g = gaps.get(e.id);
           const avgGap = g && g.count ? `Ø ${formatDuration(Math.round(g.avgMs / 1000))}` : "–";
@@ -1000,6 +1011,7 @@
       const { segs, current } = getSelectedSessionData();
       const idx = selectedSession === "prev1" ? 0 : selectedSession === "prev2" ? 1 : null;
       const payload = {
+        v: 1, // matches the schema version persist() writes - see makeSegment()
         exportedAt: Date.now(),
         world: game.world?.id ?? null,
         session: selectedSession, // "current" | "prev1" | "prev2" - informational, doesn't constrain re-import
@@ -1045,13 +1057,19 @@
             ? { session: "current", segments: [...segments], currentSegment }
             : { session: selectedSession, entry: sessionHistory[selectedSession === "prev1" ? 0 : 1] ?? null };
 
+          // Routed through makeSegment() so a segment from an older script
+          // version (missing a field added since) gets that field's current
+          // default instead of carrying `undefined` forever.
+          const importedSegments = parsed.segments.map((s) => makeSegment(s));
+          const importedCurrent = parsed.currentSegment ? makeSegment(parsed.currentSegment) : null;
+
           if (selectedSession === "current") {
-            segments = parsed.segments;
-            currentSegment = parsed.currentSegment ?? null;
+            segments = importedSegments;
+            currentSegment = importedCurrent;
             reconcileWithLiveState(); // imported data may not match what's actually live right now
           } else {
             const idx = selectedSession === "prev1" ? 0 : 1;
-            sessionHistory[idx] = { segments: parsed.segments, endedAt: parsed.endedAt ?? Date.now() };
+            sessionHistory[idx] = { segments: importedSegments, endedAt: parsed.endedAt ?? Date.now() };
           }
           persist();
           renderPanel();
@@ -1121,6 +1139,7 @@
 
     let segFilter = "all";              // "all" | "setup" | "reassigned" | "long"
     let expandedGroups = new Set();     // turn-slot keys (opening segment id) currently expanded
+    let liveGroupsSeeded = new Set();   // live-group keys already given their one-time default-expanded seed (U-03)
     let openCatSegId = null;            // which segment has its category picker open
     let menuOpen = false;               // the ⋯ overflow menu
     let postMenuOpen = false;           // the "Post report" dropdown
@@ -1197,6 +1216,20 @@
       };
     }
 
+    // Caps the resizable segment list against the *measured* chrome height
+    // (everything else in the panel) rather than the flat SEG_HEIGHT_MAX
+    // constant, so the panel's total height can never exceed the viewport -
+    // otherwise #ctp-toast, the last element in the panel, renders past
+    // window.innerHeight and becomes unreachable (U-01).
+    function maxSegHeight() {
+      const segEl = panel?.querySelector("#ctp-segments");
+      if (!panel || !segEl) return SEG_HEIGHT_MAX;
+      const top = panel.getBoundingClientRect().top;
+      const chromeHeight = panel.offsetHeight - segEl.offsetHeight;
+      const available = window.innerHeight - top - chromeHeight - 8;
+      return Math.max(SEG_HEIGHT_MIN, Math.min(SEG_HEIGHT_MAX, Math.floor(available)));
+    }
+
     function applyPanelPosition() {
       if (ui.left === null || ui.left === undefined) {
         panel.style.right = "16px";
@@ -1208,6 +1241,21 @@
       panel.style.left = `${left}px`;
       panel.style.top = `${top}px`;
       panel.style.right = "auto";
+    }
+
+    // Re-clamps position and segment-list height against the current
+    // viewport - called on load and on window resize, so a panel sized/moved
+    // on a larger screen (or before the browser window shrank) can't leave
+    // the confirm/undo bar unreachable (U-01).
+    function reclampForViewport() {
+      if (!panel || !document.body.contains(panel)) return;
+      applyPanelPosition();
+      const cap = maxSegHeight();
+      if (ui.segHeight > cap) {
+        ui.segHeight = cap;
+        panel.querySelector("#ctp-segments").style.height = `${ui.segHeight}px`;
+        persistUi();
+      }
     }
 
     // ---- Toast / inline confirm --------------------------------------------
@@ -1350,12 +1398,13 @@
       header.addEventListener("pointerdown", (ev) => {
         if (ev.target.closest("#ctp-menu-btn, #ctp-close")) return;
         const rect = el.getBoundingClientRect();
-        dragState = { dx: ev.clientX - rect.left, dy: ev.clientY - rect.top };
+        dragState = { dx: ev.clientX - rect.left, dy: ev.clientY - rect.top, moved: false };
         header.setPointerCapture(ev.pointerId);
         document.body.style.userSelect = "none";
       });
       header.addEventListener("pointermove", (ev) => {
         if (!dragState) return;
+        dragState.moved = true;
         const { left, top } = clampPanelPosition(ev.clientX - dragState.dx, ev.clientY - dragState.dy);
         el.style.left = `${left}px`;
         el.style.top = `${top}px`;
@@ -1363,10 +1412,14 @@
       });
       const endDrag = () => {
         if (!dragState) return;
+        const { moved } = dragState;
         dragState = null;
         document.body.style.userSelect = "";
-        ui.left = parseInt(el.style.left, 10);
-        ui.top = parseInt(el.style.top, 10);
+        if (!moved) return; // a plain click, not a drag - don't commit a position from unmoved "auto" styles
+        const left = parseInt(el.style.left, 10);
+        const top = parseInt(el.style.top, 10);
+        if (Number.isFinite(left)) ui.left = left;
+        if (Number.isFinite(top)) ui.top = top;
         persistUi();
       };
       header.addEventListener("pointerup", endDrag);
@@ -1382,7 +1435,7 @@
       resizer.addEventListener("pointermove", (ev) => {
         if (!resizeState) return;
         const next = resizeState.startH + (ev.clientY - resizeState.startY);
-        ui.segHeight = Math.min(SEG_HEIGHT_MAX, Math.max(SEG_HEIGHT_MIN, Math.round(next)));
+        ui.segHeight = Math.min(maxSegHeight(), Math.max(SEG_HEIGHT_MIN, Math.round(next)));
         el.querySelector("#ctp-segments").style.height = `${ui.segHeight}px`;
       });
       const endResize = () => {
@@ -1395,7 +1448,7 @@
       resizer.addEventListener("pointercancel", endResize);
 
       el.querySelector("#ctp-segments").style.height = `${ui.segHeight}px`;
-      applyPanelPosition();
+      reclampForViewport();
       return el;
     }
 
@@ -1523,6 +1576,7 @@
           openCatSegId = null;
           playerPickerSegId = null;
           expandedGroups = new Set();
+          liveGroupsSeeded = new Set();
           renderPanel();
         });
       });
@@ -1617,22 +1671,43 @@
         el.innerHTML = `<div style="font-size:11px; opacity:0.5;">No tracked time yet.</div>`;
         return;
       }
-      const total = entries.reduce((sum, e) => sum + e.totalMs, 0) || 1;
+      // Shared denominator with the chat report's bars (sessionTotalMs(), not
+      // the sum of entries) - S-01's leftover time (a segment with no active
+      // combatant, e.g. pre-combat setup) isn't in any entry, so without this
+      // it silently vanished from the strip instead of showing as "Other".
+      const entriesMs = entries.reduce((sum, e) => sum + e.totalMs, 0);
+      const sessionMs = sessionTotalMs();
+      const total = Math.max(sessionMs, entriesMs) || 1;
+      const leftoverMs = Math.max(0, sessionMs - entriesMs);
       const strip = entries.map((e) => `
         <div title="${escapeHtml(e.name)} · ${formatDuration(Math.round(e.totalMs / 1000))} · ${pct(e.totalMs, total)}%"
-             style="width:${(e.totalMs / total) * 100}%; min-width:3px; background:${e.color};"></div>`).join("");
+             style="width:${(e.totalMs / total) * 100}%; min-width:3px; background:${e.color};"></div>`).join("")
+        + (leftoverMs > 0 ? `
+        <div title="Other (no active turn, e.g. pre-combat setup) · ${formatDuration(Math.round(leftoverMs / 1000))} · ${pct(leftoverMs, total)}%"
+             style="width:${(leftoverMs / total) * 100}%; min-width:3px; background:rgba(255,255,255,0.15);"></div>` : "");
 
       let detail = "";
       if (ui.summaryOpen) {
         const max = Math.max(1, ...entries.map((e) => e.totalMs));
-        detail = `<div style="margin-top:8px;">${entries.map((e) => `
+        const rows = entries.map((e) => `
           <div style="display:flex; align-items:center; gap:7px; padding:2px 0; font-size:11px;">
             <span style="width:56px; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(e.name)}</span>
             <span style="flex:1; height:6px; border-radius:3px; background:rgba(255,255,255,0.07); overflow:hidden;">
               <span style="display:block; height:100%; width:${Math.max(3, (e.totalMs / max) * 100)}%; background:${e.color};"></span>
             </span>
             <span style="width:46px; text-align:right; opacity:0.8; font-variant-numeric:tabular-nums;">${formatDuration(Math.round(e.totalMs / 1000))}</span>
-          </div>`).join("")}</div>`;
+          </div>`).join("");
+        // The GM bar above combines monster time with any dm-recategorized
+        // time (that combination is a deliberate, closed decision - see
+        // gmTotalStats()). This is the only place that isolates just the
+        // creatures' own share of it, only computed when actually shown.
+        const npc = npcAggregate();
+        const npcLine = npc.turns
+          ? `<div style="margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.08); font-size:10px; opacity:0.6;">
+               👹 Monsters: ${formatDuration(npc.totalS)} · Ø ${formatDuration(npc.avgS)}/turn
+             </div>`
+          : "";
+        detail = `<div style="margin-top:8px;">${rows}</div>${npcLine}`;
       }
 
       const top = entries.slice(0, 3)
@@ -1696,8 +1771,15 @@
       }
       return groups;
     }
+    // Excludes "ignore"-category time - a group spanning a split-off,
+    // manually-ignored wall-clock gap shouldn't show that gap baked into its
+    // header total (statistics already exclude it via buildTurnSlots(); this
+    // keeps the segment list's own display honest about the same thing).
     function groupTotalMs(g) {
-      return g.segments.reduce((sum, s) => sum + segMs(s), 0);
+      return g.segments.reduce((sum, s) => sum + (s.category === "ignore" ? 0 : segMs(s)), 0);
+    }
+    function groupIgnoredMs(g) {
+      return g.segments.reduce((sum, s) => sum + (s.category === "ignore" ? segMs(s) : 0), 0);
     }
     function groupIsLive(g) {
       return g.segments.some((s) => s.end === null);
@@ -1712,7 +1794,7 @@
       for (const g of groups) {
         parts.push(`G${g.key}:${g.segments.length}`);
         for (const s of g.segments) {
-          parts.push(`${s.id}:${s.category}:${s.overrideOwnerId ?? ""}:${s.end === null ? "live" : s.end}`);
+          parts.push(`${s.id}:${s.category}:${s.overrideOwnerId ?? ""}:${s.defeated ? 1 : 0}:${s.end === null ? "live" : s.end}`);
         }
       }
       return parts.join("|");
@@ -1726,7 +1808,12 @@
     }
 
     function categoryPickerHTML(seg) {
-      const cats = Object.entries(CATEGORY_META).map(([key, meta]) => {
+      // "setup" is DM-only (see CATEGORY_META / defaultCategory()) - never
+      // offered as a choice on a segment a player owns.
+      const dmOwned = !resolvedOwner(seg);
+      const cats = Object.entries(CATEGORY_META)
+        .filter(([key]) => key !== "setup" || dmOwned)
+        .map(([key, meta]) => {
         const active = seg.category === key;
         const label = key === "player" ? `${meta.label}…` : meta.label;
         return `<span data-seg-id="${seg.id}" data-cat="${key}" ${active ? "" : "data-hover"}
@@ -1763,7 +1850,7 @@
       const defeated = seg.defeated ? " 💀" : "";
       const dur = formatDuration(Math.round(segMs(seg) / 1000));
       return `
-        <div style="padding:4px 0;">
+        <div data-anchor-seg="${seg.id}" style="padding:4px 0;">
           <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
             <span style="opacity:0.45; font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0;">${formatClock(seg.start)}</span>
             <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
@@ -1785,16 +1872,18 @@
         ? `<span style="width:8px; height:8px; border-radius:50%; background:${getCombatantColor(owner)}; flex-shrink:0;"></span>`
         : `<span style="flex-shrink:0;">👹</span>`;
       const live = groupIsLive(g);
-      const total = formatDuration(Math.round(groupTotalMs(g) / 1000));
 
       // A slot that never got split is one segment, so a header plus a single
       // child would print the same name and duration twice. Render it as one
       // row that carries the category chip directly - no expanding needed to
-      // reach the only thing there is to edit.
+      // reach the only thing there is to edit. Its own duration is shown as-is
+      // regardless of category - there's no "other" time in this row to
+      // conflate it with, unlike a multi-segment group's header total below.
       if (g.segments.length === 1) {
         const seg = g.segments[0];
+        const total = formatDuration(Math.round(segMs(seg) / 1000));
         return `
-          <div style="border-bottom:1px solid rgba(255,255,255,0.05); padding:6px 10px;">
+          <div data-anchor-group="${g.key}" style="border-bottom:1px solid rgba(255,255,255,0.05); padding:6px 10px;">
             <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
               <span style="opacity:0.45; font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0;">${formatClock(seg.start)}</span>
               ${dot}
@@ -1810,22 +1899,37 @@
           </div>`;
       }
 
+      const total = formatDuration(Math.round(groupTotalMs(g) / 1000));
+      const ignoredMs = groupIgnoredMs(g);
+      // The time existed and was deliberately excluded, not hidden - shown
+      // muted rather than folded silently into (or out of) the real total.
+      const ignoredTag = ignoredMs > 0
+        ? ` <span style="opacity:0.45;">· 🚫 ${formatDuration(Math.round(ignoredMs / 1000))}</span>`
+        : "";
+      // visibleSegments narrows which children render under the active
+      // filter; the count/total above always reflect the group's real,
+      // unfiltered contents so a filtered subtotal never masquerades as the
+      // whole (U-04) - the "X of Y" makes the gap explicit instead.
+      const visible = g.visibleSegments ?? g.segments;
+      const partsLabel = visible.length === g.segments.length
+        ? `${g.segments.length} parts`
+        : `${visible.length} of ${g.segments.length} parts`;
       const header = `
-        <div data-group-row data-group="${g.key}" style="display:flex; align-items:center; gap:6px;
+        <div data-group-row data-group="${g.key}" data-anchor-group="${g.key}" style="display:flex; align-items:center; gap:6px;
              padding:6px 10px; font-size:11px; cursor:pointer;">
           <span style="opacity:0.5; width:9px; flex-shrink:0;">${expanded ? "▾" : "▸"}</span>
           ${dot}
           <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
             ${escapeHtml(opener.combatantName)}${who ? ` <span style="opacity:0.45;">${escapeHtml(who)}</span>` : ""}
-            <span style="opacity:0.4;"> · ${g.segments.length} parts</span>
+            <span style="opacity:0.4;"> · ${partsLabel}</span>
             ${live ? " ●" : ""}
           </span>
-          <span ${live ? `data-group-dur="${g.key}"` : ""} style="font-variant-numeric:tabular-nums; flex-shrink:0;">${total}</span>
+          <span ${live ? `data-group-dur="${g.key}"` : ""} style="font-variant-numeric:tabular-nums; flex-shrink:0;">${total}</span>${ignoredTag}
         </div>`;
 
       if (!expanded) return `<div style="border-bottom:1px solid rgba(255,255,255,0.05);">${header}</div>`;
 
-      const children = g.segments.map((s) => segRowHTML(s)).join("");
+      const children = visible.map((s) => segRowHTML(s)).join("");
       return `
         <div style="border-bottom:1px solid rgba(255,255,255,0.05); background:#1b1b23;">
           ${header}
@@ -1836,11 +1940,24 @@
     function renderSegments() {
       const host = panel.querySelector("#ctp-segments");
       let groups = buildDisplayGroups();
+      // Liveness only seeds the *initial* expanded state, once per group key -
+      // after that it's tracked in expandedGroups like every other group, so
+      // the chevron can actually collapse a still-running group (U-03).
+      for (const g of groups) {
+        if (groupIsLive(g) && !liveGroupsSeeded.has(g.key)) {
+          expandedGroups.add(g.key);
+          liveGroupsSeeded.add(g.key);
+        }
+      }
       const filtering = segFilter !== "all";
       if (filtering) {
+        // Keep g.segments as the group's real, full list (groupTotalMs() etc.
+        // all read it) - only visibleSegments narrows for display, so a
+        // filtered group's header can still show its true total instead of a
+        // filtered subtotal masquerading as the whole (U-04).
         groups = groups
-          .map((g) => ({ ...g, segments: g.segments.filter(segmentMatchesFilter) }))
-          .filter((g) => g.segments.length);
+          .map((g) => ({ ...g, visibleSegments: g.segments.filter(segmentMatchesFilter) }))
+          .filter((g) => g.visibleSegments.length);
       }
 
       const sig = segmentSignature(groups);
@@ -1873,7 +1990,7 @@
         const nextRound = ordered[i + 1]?.round ?? null;
         // A filtered group can be auto-expanded: hiding a match behind a
         // collapsed header would defeat the point of filtering for it.
-        const expanded = filtering || expandedGroups.has(g.key) || groupIsLive(g);
+        const expanded = filtering || expandedGroups.has(g.key);
         html += groupHTML(g, expanded);
         if (g.round != null && nextRound !== g.round) {
           html += `
@@ -1883,9 +2000,29 @@
         }
       });
 
-      const scroll = host.scrollTop;
+      // Anchor on the topmost visible row's own element instead of a raw
+      // scrollTop pixel offset - the list is newest-first (new content
+      // inserts at the top), so a bare offset points at different content
+      // after every new segment (only invisible at scrollTop === 0) (U-05).
+      const hostRectBefore = host.getBoundingClientRect();
+      let anchor = null;
+      for (const node of host.querySelectorAll("[data-anchor-group], [data-anchor-seg]")) {
+        const rect = node.getBoundingClientRect();
+        if (rect.bottom > hostRectBefore.top) {
+          const attr = node.hasAttribute("data-anchor-seg") ? "data-anchor-seg" : "data-anchor-group";
+          anchor = { selector: `[${attr}="${CSS.escape(node.getAttribute(attr))}"]`, offset: rect.top - hostRectBefore.top };
+          break;
+        }
+      }
+
       host.innerHTML = html;
-      host.scrollTop = scroll;
+
+      const newAnchorEl = anchor && host.querySelector(anchor.selector);
+      if (newAnchorEl) {
+        const hostRectAfter = host.getBoundingClientRect();
+        const newOffset = newAnchorEl.getBoundingClientRect().top - hostRectAfter.top;
+        host.scrollTop = newOffset - anchor.offset;
+      }
 
       host.querySelectorAll("[data-group]").forEach((node) => {
         node.addEventListener("click", () => {
@@ -1983,5 +2120,18 @@
     }
 
     setInterval(renderPanel, 1000);
+    window.addEventListener("resize", reclampForViewport);
+
+    // The ⋯ overflow menu and "Post report" dropdown otherwise only close via
+    // their own button or picking an entry - a click anywhere else left them
+    // open (U-10).
+    document.addEventListener("pointerdown", (ev) => {
+      if (!panel || !document.body.contains(panel)) return;
+      if (!menuOpen && !postMenuOpen) return;
+      if (ev.target.closest("#ctp-menu, #ctp-menu-btn, #ctp-post-menu, #ctp-post")) return;
+      menuOpen = false;
+      postMenuOpen = false;
+      renderPanel();
+    });
   }
 })();
