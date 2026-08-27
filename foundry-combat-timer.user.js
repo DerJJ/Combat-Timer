@@ -38,13 +38,23 @@
   waitForFoundryReady(init);
 
   function init() {
+    // Each category carries its own chip colors so a glance down the segment
+    // list reads as categories, not as "which of five identical icons is
+    // highlighted". `label` is shown as text - an emoji alone was ambiguous
+    // (🧑 meant both "player-controlled" and "category: player").
     const CATEGORY_META = {
-      player: { icon: "🧑" },
-      dm:     { icon: "🎲" },
-      team:   { icon: "👥" },
-      setup:  { icon: "🛠️" },
-      ignore: { icon: "🚫" }, // manual-only (never auto-assigned) - excluded from every total, for a segment that's really just a wall-clock gap (e.g. the session resumed days later)
+      player: { icon: "🧑", label: "Player", bg: "#2f4f7a", fg: "#cfe3ff" },
+      dm:     { icon: "🎲", label: "GM",     bg: "#6b2f2f", fg: "#ffd2d2" },
+      team:   { icon: "👥", label: "Team",   bg: "#2f5f57", fg: "#c9f0e6" },
+      setup:  { icon: "🛠️", label: "Setup",  bg: "#6b5220", fg: "#ffe0ad" },
+      ignore: { icon: "🚫", label: "Ignore", bg: "#3a3a46", fg: "#b8b8c4" }, // manual-only (never auto-assigned) - excluded from every total, for a segment that's really just a wall-clock gap (e.g. the session resumed days later)
     };
+
+    // Team and Setup are categories, not people. Setup used to reuse the GM's
+    // color (getCombatantColor(null)), which made two adjacent bars in the same
+    // chat report identical and unidentifiable.
+    const TEAM_COLOR = "#383E42";
+    const SETUP_COLOR = "#6b6f74";
 
     // ---- Persistence ----
     function storageKey() {
@@ -641,16 +651,17 @@
 
     function loadDummyData() {
       if (selectedSession !== "current") {
-        alert("Switch to the '🟢 Now' tab first to load dummy data.");
+        toast("Switch to the “Now” tab first.");
         return;
       }
       if (segments.length || currentSegment) {
-        alert("The current session already has data. Reset it with 🗑️ first, then load dummy data.");
+        toast("This session already has data. Start a new session first.");
         return;
       }
       segments = generateDummySegments();
       currentSegment = null;
       persist();
+      toast("Dummy data loaded.");
     }
 
     // Combined GM total: monster-turn time (not reassigned away) PLUS any
@@ -728,6 +739,38 @@
       }));
     }
 
+    // Caps how many entities a single bar splits into. orderAndShade() spreads
+    // shades from 0.45 to 1.0 across however many items it gets - past four or
+    // five, neighbouring shades differ by so little that the bar reads as one
+    // smear, and minLabelPct suppresses most of the labels anyway. Everything
+    // past the cap is merged into a single "+N more" item placed first, so it
+    // takes the darkest shade at the far left and the named entities keep the
+    // bright end. Sums every numeric field the two callers use.
+    function capEntities(items, valueOf, isPrimary, max = MAX_BAR_ENTITIES) {
+      if (items.length <= max) return items;
+      const primaryIdx = items.findIndex(isPrimary);
+      const primary = primaryIdx >= 0 ? items[primaryIdx] : items[items.length - 1];
+      const others = items.filter((it) => it !== primary);
+      const ranked = [...others].sort((a, b) => valueOf(b) - valueOf(a));
+      // max - 2, not max - 1: the merged "+N more" item occupies one of the
+      // slices too, and the primary always keeps its own.
+      const keep = new Set(ranked.slice(0, Math.max(0, max - 2)));
+      const merged = ranked.slice(Math.max(0, max - 2));
+      const sum = (field) => merged.reduce((total, it) => total + (it[field] ?? 0), 0);
+      const mergedItem = {
+        combatantId: "__more__",
+        name: `+${merged.length} more`,
+        actorType: null,
+        ms: sum("ms"),
+        inTurnMs: sum("inTurnMs"),
+        outOfTurnMs: sum("outOfTurnMs"),
+        pausedMs: sum("pausedMs"),
+        turnCount: sum("turnCount"),
+      };
+      // Kept entities stay in their original (turn-order) sequence.
+      return [mergedItem, ...items.filter((it) => it === primary || keep.has(it))];
+    }
+
     // Renders one row's worth of proportional, colored sub-segments sharing
     // a common parent width. A part's label is only drawn when its own
     // share is wide enough to plausibly fit it - a narrow sliver still
@@ -737,8 +780,16 @@
       const total = parts.reduce((sum, p) => sum + p.ms, 0) || 1;
       return parts.filter((p) => p.ms > 0).map((p) => {
         const w = (p.ms / total) * 100;
-        const label = p.label && w >= minLabelPct
-          ? `<span style="font-size:8px; font-weight:600; color:rgba(0,0,0,0.55); white-space:nowrap;">${p.label}</span>`
+        // Two-tier label: the name when the segment is wide enough to carry
+        // it, the duration when it isn't, nothing when even that won't fit.
+        // The color is derived from the fill - segments are shaded down to 45%
+        // of the base color, so a single fixed label color is unreadable on
+        // roughly half of them.
+        const text = (p.label && w >= (p.labelPct ?? minLabelPct)) ? p.label
+          : (p.altLabel && w >= minLabelPct) ? p.altLabel
+          : "";
+        const label = text
+          ? `<span style="font-size:8px; font-weight:600; color:${labelColorOn(p.color)} !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:0 2px;">${text}</span>`
           : "";
         return `<div style="width:${w}%; height:100%; background:${p.color} !important;
                      box-shadow:inset 0 1px 0 rgba(255,255,255,0.25) !important;
@@ -752,15 +803,20 @@
     // ordinary single-entity player with no paused/out-of-turn time this
     // degenerates to exactly today's single solid bar with no indicator row.
     function buildPlayerBarRows(e) {
-      const ordered = orderAndShade(e.byEntity, (en) => en.actorType === "character")
+      const entities = capEntities(e.byEntity, (en) => en.inTurnMs + en.outOfTurnMs, (en) => en.actorType === "character");
+      const ordered = orderAndShade(entities, (en) => en.actorType === "character")
         .map(({ item, shade }) => ({ item, color: darkenHex(e.color, shade) }));
       const showLabels = ordered.length > 1;
-      const personTotalMs = e.byEntity.reduce((sum, en) => sum + en.inTurnMs + en.outOfTurnMs, 0) || 1;
+      const personTotalMs = entities.reduce((sum, en) => sum + en.inTurnMs + en.outOfTurnMs, 0) || 1;
 
       const mainParts = ordered.map(({ item, color }) => ({
         ms: item.inTurnMs + item.outOfTurnMs,
         color,
-        label: showLabels ? formatDuration(Math.round((item.inTurnMs + item.outOfTurnMs) / 1000)) : null,
+        // Name where it fits, duration where it doesn't - an unlabelled stack
+        // of shades tells the reader nothing about who is in it.
+        label: showLabels ? escapeHtml(item.name) : null,
+        labelPct: 28,
+        altLabel: showLabels ? formatDuration(Math.round((item.inTurnMs + item.outOfTurnMs) / 1000)) : null,
       }));
       const mainSegs = proportionalSegmentsHtml(mainParts, 12);
 
@@ -789,13 +845,16 @@
     // - one segment per contributing combatant, no indicator row (the GM
     // bucket doesn't track paused/out-of-turn time the way a player does).
     function buildGmBarSegments(gm, gmColor) {
-      const ordered = orderAndShade(gm.byEntity, () => false)
+      const entities = capEntities(gm.byEntity, (en) => en.ms, () => false);
+      const ordered = orderAndShade(entities, () => false)
         .map(({ item, shade }) => ({ item, color: darkenHex(gmColor, shade) }));
       const showLabels = ordered.length > 1;
       const parts = ordered.map(({ item, color }) => ({
         ms: item.ms,
         color,
-        label: showLabels ? formatDuration(Math.round(item.ms / 1000)) : null,
+        label: showLabels ? escapeHtml(item.name) : null,
+        labelPct: 28,
+        altLabel: showLabels ? formatDuration(Math.round(item.ms / 1000)) : null,
       }));
       return proportionalSegmentsHtml(parts, 12);
     }
@@ -816,22 +875,12 @@
     }
 
     function buildBarsContent() {
-      const playerEntries = perCombatantStats().map((e) => ({ ...e, icon: "🧑", kind: "player" }));
-      const gm = gmTotalStats();
-      const cat = categoryTotals();
-      const entries = [...playerEntries];
-      if (gm.totalMs > 0) {
-        entries.push({ id: "gm-total", name: "GM", icon: "🎲", color: getCombatantColor(null), totalMs: gm.totalMs, turnCount: gm.turnCount, byEntity: gm.byEntity, kind: "gm" });
-      }
-      if (cat.teamMs > 0) {
-        entries.push({ id: "team-total", name: "Team", icon: "👥", color: "#383E42", totalMs: cat.teamMs, turnCount: 0, kind: "flat" });
-      }
-      if (cat.setupMs > 0) {
-        entries.push({ id: "setup-total", name: "Setup", icon: "🛠️", color: getCombatantColor(null), totalMs: cat.setupMs, turnCount: 0, kind: "flat" });
-      }
-      entries.sort((a, b) => b.totalMs - a.totalMs);
+      // Same entry list the panel summary uses, so the two can never disagree
+      // about who is in the session.
+      const entries = summaryEntries();
       const max = Math.max(1, ...entries.map((e) => e.totalMs));
       const sessionMs = sessionTotalMs();
+      let anyIndicator = false;
 
       const bars = entries.map((e) => {
         const s = Math.round(e.totalMs / 1000);
@@ -844,6 +893,7 @@
           const built = buildPlayerBarRows(e);
           fillInner = built.mainSegs;
           indicatorRow = built.indicatorRow;
+          if (indicatorRow) anyIndicator = true;
         } else if (e.kind === "gm") {
           fillInner = buildGmBarSegments(e, e.color);
         } else {
@@ -864,10 +914,21 @@
           </div>`;
       }).join("");
 
+      // The indicator row's two fixed colors are meaningless to anyone who
+      // hasn't read the README - and after "Reveal to Everyone", that's most
+      // people who see this. Only rendered when a row actually exists.
+      const swatch = (color) => `<span style="display:inline-block; width:7px; height:7px; border-radius:2px;
+             background:${color} !important; vertical-align:middle; margin-right:3px;"></span>`;
+      const legend = anyIndicator
+        ? `<div style="font-size:9px; opacity:0.5; margin-top:8px; color:#eee !important;">
+             Thin row: ${swatch("#e8a33d")}paused · ${swatch("#4fc3d9")}out of turn
+           </div>`
+        : "";
+
       return wrapCard({
         title: "⚔️ Combat Times",
         subtitle: `Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}`,
-        body: bars,
+        body: bars + legend,
       });
     }
 
@@ -912,17 +973,24 @@
     // real, permanent delete.
     function deleteSelectedSession() {
       if (selectedSession === "current") {
-        if (!confirm("Start a new session now? The current one is archived, not lost.")) return;
-        archiveSessionIfNeeded();
-        reconcileWithLiveState();
-      } else {
-        const idx = selectedSession === "prev1" ? 0 : 1;
-        if (!sessionHistory[idx]) return;
-        if (!confirm("Really delete this archived session? This cannot be undone.")) return;
+        confirmBar("Start a new session? The current one is archived, not lost.", "Start", () => {
+          archiveSessionIfNeeded();
+          reconcileWithLiveState();
+          persist();
+          toast("New session started. The old one is under “Prev”.");
+          renderPanel();
+        });
+        return;
+      }
+      const idx = selectedSession === "prev1" ? 0 : 1;
+      if (!sessionHistory[idx]) return;
+      confirmBar("Delete this archived session? No undo.", "Delete", () => {
         sessionHistory.splice(idx, 1);
         selectedSession = "current";
-      }
-      persist();
+        persist();
+        toast("Archived session deleted.");
+        renderPanel();
+      });
     }
 
     // Exports only the currently VIEWED session (whichever tab is selected),
@@ -961,28 +1029,56 @@
         try {
           parsed = JSON.parse(reader.result);
         } catch (e) {
-          alert("That file isn't valid JSON.");
+          toast("That file isn't valid JSON.");
           return;
         }
         if (!Array.isArray(parsed.segments)) {
-          alert("That file doesn't look like Combat Timer session data (missing a segments array).");
+          toast("That file isn't Combat Timer session data.");
           return;
         }
-        const label = selectedSession === "current" ? "current (Now)" : selectedSession === "prev1" ? "-1" : "-2";
-        if (!confirm(`Replace the "${label}" tab's data with the imported file? This cannot be undone.`)) return;
+        const label = selectedSession === "current" ? "Now" : selectedSession === "prev1" ? "Prev" : "Older";
+        confirmBar(`Replace the “${label}” tab with this file?`, "Replace", () => {
+          // One-level snapshot taken immediately before the overwrite. Import
+          // still replaces outright (no archiving), but the thing it replaced
+          // is now recoverable for as long as the panel stays open.
+          importUndo = selectedSession === "current"
+            ? { session: "current", segments: [...segments], currentSegment }
+            : { session: selectedSession, entry: sessionHistory[selectedSession === "prev1" ? 0 : 1] ?? null };
 
-        if (selectedSession === "current") {
-          segments = parsed.segments;
-          currentSegment = parsed.currentSegment ?? null;
-          reconcileWithLiveState(); // imported data may not match what's actually live right now
-        } else {
-          const idx = selectedSession === "prev1" ? 0 : 1;
-          sessionHistory[idx] = { segments: parsed.segments, endedAt: parsed.endedAt ?? Date.now() };
-        }
-        persist();
-        renderPanel();
+          if (selectedSession === "current") {
+            segments = parsed.segments;
+            currentSegment = parsed.currentSegment ?? null;
+            reconcileWithLiveState(); // imported data may not match what's actually live right now
+          } else {
+            const idx = selectedSession === "prev1" ? 0 : 1;
+            sessionHistory[idx] = { segments: parsed.segments, endedAt: parsed.endedAt ?? Date.now() };
+          }
+          persist();
+          renderPanel();
+          toast(`Imported into “${label}”.`, "Undo", () => undoImport());
+        });
       };
       reader.readAsText(file);
+    }
+
+    // Restores whatever the last import overwrote. Only one level deep and
+    // only for this page session - it's a safety net for a misclick, not a
+    // history feature.
+    function undoImport() {
+      if (!importUndo) return;
+      if (importUndo.session === "current") {
+        segments = importUndo.segments;
+        currentSegment = importUndo.currentSegment;
+        reconcileWithLiveState();
+      } else {
+        const idx = importUndo.session === "prev1" ? 0 : 1;
+        if (importUndo.entry) sessionHistory[idx] = importUndo.entry;
+        else sessionHistory.splice(idx, 1);
+      }
+      importUndo = null;
+      persist();
+      toast("Import undone.");
+      renderPanel();
     }
 
     async function postToChat(content, kind) {
@@ -994,12 +1090,88 @@
       });
     }
 
-    // ---- Open/close panel (shared by ✕, the reopen button, and the scene control) ----
+    // ---- Panel UI state ----------------------------------------------------
+    // Everything below is pure presentation state. None of it is part of the
+    // tracked data, and none of it is stored in the tracking blob - it lives
+    // under its own localStorage key so a corrupt/absent UI state can never
+    // take session data down with it.
+    function uiStorageKey() {
+      return `ctp-ui-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
+    }
+    const UI_DEFAULTS = { left: null, top: 60, segHeight: 240, summaryOpen: false };
+    let ui = { ...UI_DEFAULTS };
+    try {
+      const savedUi = JSON.parse(localStorage.getItem(uiStorageKey()) ?? "null");
+      if (savedUi && typeof savedUi === "object") ui = { ...UI_DEFAULTS, ...savedUi };
+    } catch (e) {
+      console.warn("Combat Timer: could not load panel layout", e);
+    }
+    function persistUi() {
+      try {
+        localStorage.setItem(uiStorageKey(), JSON.stringify(ui));
+      } catch (e) {
+        console.warn("Combat Timer: could not save panel layout", e);
+      }
+    }
+
+    const PANEL_WIDTH = 300;
+    const MAX_BAR_ENTITIES = 4; // per-entity stack cap in the chat bar chart
+    const SEG_HEIGHT_MIN = 120;
+    const SEG_HEIGHT_MAX = 700;
+
+    let segFilter = "all";              // "all" | "setup" | "reassigned" | "long"
+    let expandedGroups = new Set();     // turn-slot keys (opening segment id) currently expanded
+    let openCatSegId = null;            // which segment has its category picker open
+    let menuOpen = false;               // the ⋯ overflow menu
+    let postMenuOpen = false;           // the "Post report" dropdown
+    let importUndo = null;              // one-level undo snapshot taken right before an import
+    let lastSegSig = null;              // see renderSegments(): skips the rebuild when nothing changed
+    let toastTimer = null;
+    let dragState = null;
+    let resizeState = null;
+    // Declared here rather than at the `buildPanel()` call site: buildPanel()
+    // assigns to it while running (applyPanelPosition() has to measure the real
+    // element), which would hit the temporal dead zone if the binding were
+    // created by that same call's initializer.
+    let panel = null;
+
+    // ---- Small shared helpers ----------------------------------------------
+    // 24h regardless of locale: the column is ~40px wide and a locale that
+    // renders "09:30 PM" pushes the name column into an ellipsis.
+    function formatClock(ts) {
+      const d = new Date(ts);
+      return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    }
+    // WCAG relative luminance, used to decide whether a label drawn ON a fill
+    // should be dark or light. The bar segments are shaded down to 45% of the
+    // base color, so a single hardcoded label color is unreadable on roughly
+    // half of them.
+    function relLuminance(hex) {
+      const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex ?? "");
+      if (!m) return 0.5;
+      const lin = [1, 2, 3].map((i) => {
+        const c = parseInt(m[i], 16) / 255;
+        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+    }
+    function labelColorOn(hex) {
+      return relLuminance(hex) > 0.3 ? "rgba(0,0,0,0.62)" : "rgba(255,255,255,0.85)";
+    }
+    function ownerName(id) {
+      return id ? (game.users.get(id)?.name ?? "?") : null;
+    }
+    function pct(part, whole) {
+      return whole > 0 ? Math.round((part / whole) * 100) : 0;
+    }
+
+    // ---- Panel chrome -------------------------------------------------------
     function openPanel() {
       const reopenBtn = document.getElementById("ctp-reopen");
       if (reopenBtn) reopenBtn.remove();
       if (!document.body.contains(panel)) panel = buildPanel();
       panelVisible = true;
+      lastSegSig = null; // freshly built DOM - force a full segment render
     }
     function closePanel() {
       if (document.body.contains(panel)) panel.remove();
@@ -1011,144 +1183,252 @@
       else openPanel();
     }
 
-    // ---- Floating panel ----
-    // This MUST succeed no matter what - built and shown before we touch
-    // anything experimental (like the scene controls integration below),
-    // so a failure there can never prevent the panel itself from existing.
+    // Keeps the panel inside the viewport. Called on load (the window may have
+    // been resized, or the panel dragged on a much wider screen last session)
+    // and on every drag move, so it can never end up somewhere unreachable.
+    function clampPanelPosition(left, top) {
+      const w = panel?.offsetWidth || PANEL_WIDTH;
+      const h = panel?.offsetHeight || 200;
+      const maxLeft = Math.max(0, window.innerWidth - w);
+      const maxTop = Math.max(0, window.innerHeight - Math.min(h, 120)); // keep at least the header reachable
+      return {
+        left: Math.min(Math.max(0, left), maxLeft),
+        top: Math.min(Math.max(0, top), maxTop),
+      };
+    }
+
+    function applyPanelPosition() {
+      if (ui.left === null || ui.left === undefined) {
+        panel.style.right = "16px";
+        panel.style.left = "auto";
+        panel.style.top = `${ui.top ?? 60}px`;
+        return;
+      }
+      const { left, top } = clampPanelPosition(ui.left, ui.top ?? 60);
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+      panel.style.right = "auto";
+    }
+
+    // ---- Toast / inline confirm --------------------------------------------
+    // Replaces alert()/confirm(). A browser dialog steals focus from Foundry
+    // (which listens for keybinds globally) and looks nothing like the panel;
+    // both of these render inside it and dismiss themselves.
+    function toast(message, actionLabel = null, onAction = null) {
+      const el = panel?.querySelector("#ctp-toast");
+      if (!el) return;
+      if (toastTimer) clearTimeout(toastTimer);
+      el.innerHTML = `
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="flex:1;">${escapeHtml(message)}</span>
+          ${actionLabel ? `<span data-toast-action style="cursor:pointer; padding:2px 8px; border-radius:5px; border:1px solid #4a4a58;">${escapeHtml(actionLabel)}</span>` : ""}
+        </div>`;
+      el.style.display = "block";
+      if (actionLabel && onAction) {
+        el.querySelector("[data-toast-action]").addEventListener("click", () => {
+          hideToast();
+          onAction();
+        });
+      }
+      toastTimer = setTimeout(hideToast, actionLabel ? 9000 : 3500);
+    }
+    function hideToast() {
+      const el = panel?.querySelector("#ctp-toast");
+      if (!el) return;
+      el.style.display = "none";
+      el.innerHTML = "";
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    // Destructive actions get a two-button bar in the same slot instead of a
+    // native confirm(), so the panel never loses focus mid-combat.
+    function confirmBar(message, confirmLabel, onConfirm) {
+      const el = panel?.querySelector("#ctp-toast");
+      if (!el) return;
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = null;
+      el.innerHTML = `
+        <div style="display:flex; align-items:center; gap:6px;">
+          <span style="flex:1;">${escapeHtml(message)}</span>
+          <span data-confirm-no style="cursor:pointer; padding:2px 8px; border-radius:5px; border:1px solid #4a4a58;">Cancel</span>
+          <span data-confirm-yes style="cursor:pointer; padding:2px 8px; border-radius:5px; background:#8c3b3b; color:#fff;">${escapeHtml(confirmLabel)}</span>
+        </div>`;
+      el.style.display = "block";
+      el.querySelector("[data-confirm-no]").addEventListener("click", () => hideToast());
+      el.querySelector("[data-confirm-yes]").addEventListener("click", () => {
+        hideToast();
+        onConfirm();
+      });
+    }
+
+    // ---- Panel construction -------------------------------------------------
+    // This MUST succeed no matter what - it is the first thing init() does that
+    // can possibly fail, so nothing experimental is allowed to run before it.
+    // Section order follows the reading order: what scopes the view (tabs) is
+    // above what it scopes, and the segment list - the only editable surface -
+    // gets the largest, resizable share of the height.
     function buildPanel() {
       const el = document.createElement("div");
       el.id = "combat-timer-panel";
       el.style.cssText = `
         position: fixed; top: 60px; right: 16px; z-index: 9999;
-        width: 260px; font-family: "Signika", sans-serif; font-size: 12px;
-        background: linear-gradient(160deg, #1e1e26, #14141a);
+        width: ${PANEL_WIDTH}px; font-family: "Signika", sans-serif; font-size: 12px;
+        background: #17171d;
         border: 1px solid #3a3a46; border-radius: 10px;
         box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: #ddd; overflow: hidden;
       `;
 
       el.innerHTML = `
-        <div id="ctp-header" style="cursor:move; padding:8px 10px; background:#2a2a35;
-             display:flex; justify-content:space-between; align-items:center;
-             border-bottom:1px solid #3a3a46;">
+        <div id="ctp-header" style="cursor:move; padding:7px 10px; background:#2a2a35;
+             display:flex; justify-content:space-between; align-items:center; user-select:none;">
           <span style="font-weight:600; letter-spacing:0.3px;">⚔️ Combat Times</span>
-          <span>
-            <span id="ctp-dummy" title="Load dummy data (only if empty)" style="cursor:pointer; opacity:0.6; margin-right:8px;">🧪</span>
-            <span id="ctp-reset" title="Start a new session now (archives the current one, nothing is lost)" style="cursor:pointer; opacity:0.6; margin-right:8px;">🆕</span>
-            <span id="ctp-close" style="cursor:pointer; opacity:0.6;">✕</span>
+          <span style="display:flex; gap:2px;">
+            <span id="ctp-menu-btn" title="More actions" style="cursor:pointer; opacity:0.6; padding:0 5px; border-radius:4px;">⋯</span>
+            <span id="ctp-close" title="Hide the panel" style="cursor:pointer; opacity:0.6; padding:0 5px; border-radius:4px;">✕</span>
           </span>
         </div>
-        <div id="ctp-status" style="padding:6px 10px; font-size:11px; opacity:0.75;"></div>
-        <div id="ctp-rows" style="padding:2px 10px 4px;"></div>
-        <div id="ctp-footer" style="padding:0 10px 6px; font-size:11px; opacity:0.8;"></div>
-        <div style="padding:4px 10px; font-size:10px; opacity:0.55; border-top:1px solid #3a3a46;">
-          Segments (tap icons to recategorize)
+
+        <div id="ctp-menu" style="display:none; background:#20202a; border-bottom:1px solid #3a3a46; padding:4px;"></div>
+
+        <div id="ctp-tabs" style="display:flex; gap:4px; padding:6px 8px; background:#20202a;
+             border-bottom:1px solid #3a3a46; font-size:11px;"></div>
+
+        <div id="ctp-live" style="padding:8px 10px; border-bottom:1px solid #2c2c36;"></div>
+
+        <div id="ctp-summary" style="padding:8px 10px; border-bottom:1px solid #2c2c36;"></div>
+
+        <div id="ctp-filters" style="display:flex; gap:5px; align-items:center; padding:6px 10px;
+             font-size:10px; border-bottom:1px solid #2c2c36;"></div>
+
+        <div id="ctp-segments" style="overflow-y:auto; overflow-x:hidden;"></div>
+
+        <div id="ctp-resize" title="Drag to resize the segment list"
+             style="height:9px; cursor:ns-resize; display:flex; align-items:center; justify-content:center;
+                    border-top:1px solid #2c2c36; user-select:none;">
+          <span style="width:26px; height:2px; border-radius:1px; background:#4a4a58;"></span>
         </div>
-        <div id="ctp-segments" style="max-height:170px; overflow-y:auto; padding:2px 10px 6px;"></div>
-        <div id="ctp-toolbar" style="display:flex; gap:4px; padding:6px 10px;
-             border-top:1px solid #3a3a46; border-bottom:1px solid #3a3a46; font-size:10px;"></div>
-        <div id="ctp-io" style="display:flex; gap:4px; padding:4px 10px; font-size:10px;">
-          <span data-action="export" title="Export the currently viewed session (Now / -1 / -2) as a JSON file"
-                style="flex:1; text-align:center; cursor:pointer; padding:3px 2px; border-radius:4px;
-                       opacity:0.6; border:1px solid #3a3a46;">📤 Export</span>
-          <span data-action="import" title="Import a JSON file, replacing the currently viewed session"
-                style="flex:1; text-align:center; cursor:pointer; padding:3px 2px; border-radius:4px;
-                       opacity:0.6; border:1px solid #3a3a46;">📥 Import</span>
-          <input type="file" id="ctp-import-file" accept="application/json" style="display:none;">
-        </div>
-        <div style="padding:6px 10px; display:flex; flex-direction:column; gap:4px;">
-          <button id="ctp-post-bars" style="padding:5px; border:none; border-radius:6px;
+
+        <div id="ctp-post-menu" style="display:none; padding:4px 8px 0;"></div>
+
+        <div style="padding:7px 10px;">
+          <button id="ctp-post" style="width:100%; padding:6px; border:none; border-radius:6px;
                   background:#4b3fa0; color:#fff; cursor:pointer; font-size:11px;">
-            📊 Post bar chart (only me)
-          </button>
-          <button id="ctp-post-players" style="padding:5px; border:none; border-radius:6px;
-                  background:#2f6fa0; color:#fff; cursor:pointer; font-size:11px;">
-            🧑 Post player list (only me)
+            📊 Post report ▾
           </button>
         </div>
+
+        <div id="ctp-toast" style="display:none; padding:6px 10px; font-size:11px;
+             background:#20202a; border-top:1px solid #3a3a46;"></div>
+
+        <input type="file" id="ctp-import-file" accept="application/json" style="display:none;">
       `;
       document.body.appendChild(el);
+      panel = el; // applyPanelPosition() measures the real element
 
       el.querySelector("#ctp-close").addEventListener("click", () => closePanel());
-      el.querySelector("#ctp-dummy").addEventListener("click", () => loadDummyData());
-      el.querySelector("#ctp-reset").addEventListener("click", () => deleteSelectedSession());
-      el.querySelector("#ctp-post-bars").addEventListener("click", () => postToChat(buildBarsContent(), "bars"));
-      el.querySelector("#ctp-post-players").addEventListener("click", () => postToChat(buildPlayerListContent(), "players"));
-      el.querySelector('#ctp-io [data-action="export"]').addEventListener("click", () => exportSelectedSession());
-      el.querySelector('#ctp-io [data-action="import"]').addEventListener("click", () => el.querySelector("#ctp-import-file").click());
+      el.querySelector("#ctp-menu-btn").addEventListener("click", () => {
+        menuOpen = !menuOpen;
+        postMenuOpen = false;
+        renderPanel();
+      });
+      el.querySelector("#ctp-post").addEventListener("click", () => {
+        postMenuOpen = !postMenuOpen;
+        menuOpen = false;
+        renderPanel();
+      });
       el.querySelector("#ctp-import-file").addEventListener("change", (ev) => {
         const file = ev.target.files[0];
         ev.target.value = ""; // allow re-selecting the same file later
         if (file) importSessionFromFile(file);
       });
 
-      el.querySelector("#ctp-header").addEventListener("mousedown", (ev) => {
+      // Drag: pointer events (so it keeps tracking outside the window), the
+      // position is clamped into the viewport and persisted, and text
+      // selection is suppressed for the duration - dragging over Foundry's UI
+      // used to select whatever was underneath.
+      const header = el.querySelector("#ctp-header");
+      header.addEventListener("pointerdown", (ev) => {
+        if (ev.target.closest("#ctp-menu-btn, #ctp-close")) return;
         const rect = el.getBoundingClientRect();
-        dragOffset = { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+        dragState = { dx: ev.clientX - rect.left, dy: ev.clientY - rect.top };
+        header.setPointerCapture(ev.pointerId);
+        document.body.style.userSelect = "none";
       });
-      document.addEventListener("mousemove", (ev) => {
-        if (!dragOffset) return;
-        el.style.left = `${ev.clientX - dragOffset.x}px`;
-        el.style.top = `${ev.clientY - dragOffset.y}px`;
+      header.addEventListener("pointermove", (ev) => {
+        if (!dragState) return;
+        const { left, top } = clampPanelPosition(ev.clientX - dragState.dx, ev.clientY - dragState.dy);
+        el.style.left = `${left}px`;
+        el.style.top = `${top}px`;
         el.style.right = "auto";
       });
-      document.addEventListener("mouseup", () => (dragOffset = null));
+      const endDrag = () => {
+        if (!dragState) return;
+        dragState = null;
+        document.body.style.userSelect = "";
+        ui.left = parseInt(el.style.left, 10);
+        ui.top = parseInt(el.style.top, 10);
+        persistUi();
+      };
+      header.addEventListener("pointerup", endDrag);
+      header.addEventListener("pointercancel", endDrag);
 
+      // Resize: same pattern, adjusting the segment pane's height only.
+      const resizer = el.querySelector("#ctp-resize");
+      resizer.addEventListener("pointerdown", (ev) => {
+        resizeState = { startY: ev.clientY, startH: ui.segHeight };
+        resizer.setPointerCapture(ev.pointerId);
+        document.body.style.userSelect = "none";
+      });
+      resizer.addEventListener("pointermove", (ev) => {
+        if (!resizeState) return;
+        const next = resizeState.startH + (ev.clientY - resizeState.startY);
+        ui.segHeight = Math.min(SEG_HEIGHT_MAX, Math.max(SEG_HEIGHT_MIN, Math.round(next)));
+        el.querySelector("#ctp-segments").style.height = `${ui.segHeight}px`;
+      });
+      const endResize = () => {
+        if (!resizeState) return;
+        resizeState = null;
+        document.body.style.userSelect = "";
+        persistUi();
+      };
+      resizer.addEventListener("pointerup", endResize);
+      resizer.addEventListener("pointercancel", endResize);
+
+      el.querySelector("#ctp-segments").style.height = `${ui.segHeight}px`;
+      applyPanelPosition();
       return el;
     }
 
-    // Hover states for every clickable control in the panel (header icons,
-    // toolbar/split/session tabs, segment category + player-picker chips,
-    // chat-report buttons) plus the floating reopen button. Injected once as
-    // a real <style> tag rather than per-element JS listeners, since
-    // renderPanel() rebuilds innerHTML every tick anyway - a stylesheet rule
-    // survives that, inline :hover state wouldn't. This only affects the
-    // LOCAL panel/reopen button, never ChatMessage content (hard constraint
-    // #2 is about chat HTML specifically and doesn't apply here).
     function injectPanelStyles() {
       if (document.getElementById("ctp-styles")) return;
       const style = document.createElement("style");
       style.id = "ctp-styles";
       style.textContent = `
-        #combat-timer-panel #ctp-dummy,
-        #combat-timer-panel #ctp-reset,
-        #combat-timer-panel #ctp-close,
-        #combat-timer-panel #ctp-toolbar [data-action="split"],
-        #combat-timer-panel #ctp-toolbar [data-session],
-        #combat-timer-panel #ctp-io [data-action],
-        #combat-timer-panel #ctp-segments [data-cat],
-        #combat-timer-panel #ctp-segments [data-owner-pick],
-        #combat-timer-panel #ctp-post-bars,
-        #combat-timer-panel #ctp-post-players,
-        #ctp-reopen {
+        #combat-timer-panel [data-hover] {
           transition: background 0.12s ease, opacity 0.12s ease, filter 0.12s ease;
         }
-        #combat-timer-panel #ctp-dummy:hover,
-        #combat-timer-panel #ctp-reset:hover,
-        #combat-timer-panel #ctp-close:hover {
-          opacity: 1 !important;
-          background: rgba(255,255,255,0.14);
-          border-radius: 4px;
-        }
-        #combat-timer-panel #ctp-toolbar [data-action="split"]:hover,
-        #combat-timer-panel #ctp-toolbar [data-session][data-available="true"]:hover,
-        #combat-timer-panel #ctp-io [data-action]:hover {
+        #combat-timer-panel [data-hover]:hover {
           opacity: 1 !important;
           background: rgba(255,255,255,0.12);
         }
-        #combat-timer-panel #ctp-segments [data-cat]:hover {
+        #combat-timer-panel #ctp-menu-btn:hover,
+        #combat-timer-panel #ctp-close:hover {
           opacity: 1 !important;
-          filter: brightness(1.3);
+          background: rgba(255,255,255,0.14);
         }
-        #combat-timer-panel #ctp-segments [data-owner-pick]:hover {
-          opacity: 1 !important;
-          filter: brightness(1.25);
+        #combat-timer-panel #ctp-resize:hover span {
+          background: #6a6a7c;
         }
-        #combat-timer-panel #ctp-post-bars:hover,
-        #combat-timer-panel #ctp-post-players:hover {
+        #combat-timer-panel #ctp-post:hover,
+        #ctp-reopen:hover {
           filter: brightness(1.15);
         }
-        #ctp-reopen:hover {
-          filter: brightness(1.3);
+        #combat-timer-panel [data-group-row]:hover {
+          background: rgba(255,255,255,0.05);
+        }
+        #combat-timer-panel #ctp-segments::-webkit-scrollbar { width: 8px; }
+        #combat-timer-panel #ctp-segments::-webkit-scrollbar-thumb {
+          background: #3a3a46; border-radius: 4px;
         }
       `;
       document.head.appendChild(style);
@@ -1169,202 +1449,472 @@
       document.body.appendChild(btn);
     }
 
-    let panel = buildPanel();
+    panel = buildPanel();
     injectPanelStyles();
 
     // Note: a scene-controls toolbar button was attempted and abandoned.
     // getSceneControlButtons fires exactly once, very early during Foundry's
     // own boot sequence - before a @run-at document-idle Tampermonkey script
     // can possibly attach a listener - and ui.controls.render() does not
-    // re-invoke it afterward (confirmed via logging: the hook never fired,
-    // despite ui.controls being fully initialized and rendered by the time
-    // we checked). This is a structural timing mismatch, not a fixable bug.
-    // The floating ⚔️ reopen button (buildReopenButton(), left-middle of the
-    // screen) is the only entry point back into the panel once closed.
+    // re-invoke it afterward. The floating ⚔️ reopen button is therefore the
+    // only entry point back into the panel once closed.
 
-    function segmentRowHTML(seg) {
-      const s = Math.round(segMs(seg) / 1000);
-      const live = seg.end === null;
-      const triggerIcon = seg.trigger === "pause" ? "⏸ " : seg.trigger === "split" ? "✂️ " : (seg.trigger === "unpause" || seg.trigger === "resume") ? "▶ " : "";
-      const who = !seg.combatantId ? "(no combat)" : `${isPlayerControlled(seg) ? "🧑" : "👹"} ${escapeHtml(seg.combatantName)}`;
-      const defTag = seg.defeated ? " 💀" : "";
-      const overrideTag = seg.overrideOwnerId ? ` → ${escapeHtml(game.users.get(seg.overrideOwnerId)?.name ?? "?")}` : "";
-      const buttons = Object.entries(CATEGORY_META).map(([key, meta]) => `
-        <span data-seg-id="${seg.id}" data-cat="${key}"
-          style="cursor:pointer; padding:1px 5px; border-radius:4px; font-size:11px;
-                 ${seg.category === key ? "background:#4b3fa0;" : "opacity:0.35;"}">
-          ${meta.icon}
-        </span>`).join("");
+    // ---- Section renderers ---------------------------------------------------
 
-      let picker = "";
-      if (playerPickerSegId === seg.id) {
-        const players = getCombatPlayers();
-        const chips = [
-          `<span data-seg-id="${seg.id}" data-owner-pick="__default__"
-             style="cursor:pointer; padding:1px 6px; border-radius:4px; font-size:10px; margin:2px;
-                    opacity:0.7; border:1px dashed rgba(255,255,255,0.35);">↩ Default</span>`,
-          ...players.map((p) => `
-            <span data-seg-id="${seg.id}" data-owner-pick="${p.ownerId}"
-              style="cursor:pointer; padding:1px 6px; border-radius:4px; font-size:10px; margin:2px;
-                     background:${p.color}; color:#fff;">${escapeHtml(p.name)}</span>`),
-        ].join("");
-        picker = `<div style="margin-top:3px; padding-top:3px; border-top:1px dashed rgba(255,255,255,0.15);">${chips}</div>`;
-      }
-
-      return `
-        <div style="padding:3px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
-          <div style="display:flex; justify-content:space-between; font-size:11px;">
-            <span>${triggerIcon}${who}${overrideTag}${defTag}${live ? " ●" : ""}</span>
-            <span>${formatDuration(s)}</span>
-          </div>
-          <div style="margin-top:2px;">${buttons}</div>
-          ${picker}
-        </div>`;
-    }
-
-    function roundMarkerHTML(round) {
-      return `
-        <div style="text-align:center; font-size:10px; letter-spacing:0.5px; opacity:0.55;
-                    margin:3px 0; padding:2px 0;
-                    border-top:1px dashed rgba(255,255,255,0.15); border-bottom:1px dashed rgba(255,255,255,0.15);">
-          🔄 Round ${round}
-        </div>`;
-    }
-
-    // Interleaves "new round" markers into the (chronological) segment list
-    // wherever the round number advances at a turn start, then reverses the
-    // whole thing so the newest entry ends up on top.
-    function buildSegmentTimeline(viewSegs, viewCurrent) {
-      const items = [];
-      let lastRound = null;
-      for (const seg of viewSegs) {
-        if (isTurnStart(seg) && seg.round != null && seg.round !== lastRound) {
-          items.push({ marker: seg.round });
-          lastRound = seg.round;
-        }
-        items.push({ seg });
-      }
-      if (viewCurrent) {
-        if (isTurnStart(viewCurrent) && viewCurrent.round != null && viewCurrent.round !== lastRound) {
-          items.push({ marker: viewCurrent.round });
-        }
-        items.push({ seg: viewCurrent });
-      }
-      return items.reverse();
-    }
-
-    function renderPanel() {
-      persist();
-      if (!panelVisible || !document.body.contains(panel)) return;
-
-      // Toolbar: split button + session tabs, all equal width so it looks
-      // like one consistent row of buttons.
-      const toolbarEl = panel.querySelector("#ctp-toolbar");
-      // "available" only affects dimming, not whether the tab can be opened -
-      // an empty archived slot must still be selectable so imported data has
-      // somewhere to land.
-      const tabs = [
-        { key: "current", label: "🟢 Now", hasData: true },
-        { key: "prev1", label: "📦 -1", hasData: !!sessionHistory[0] },
-        { key: "prev2", label: "📦 -2", hasData: !!sessionHistory[1] },
+    function renderMenu() {
+      const el = panel.querySelector("#ctp-menu");
+      el.style.display = menuOpen ? "block" : "none";
+      if (!menuOpen) return;
+      const archived = selectedSession !== "current";
+      const items = [
+        { key: "new", label: "🆕 Start a new session", hint: "archives the current one" },
+        ...(archived ? [{ key: "delete", label: "🗑️ Delete this archived session", hint: "permanent", danger: true }] : []),
+        { key: "export", label: "📤 Export this session" },
+        { key: "import", label: "📥 Import into this session" },
+        ...(importUndo ? [{ key: "undo", label: "↩ Undo last import" }] : []),
+        { key: "dummy", label: "🧪 Load dummy data", hint: "only if empty" },
+        { key: "resetpos", label: "📍 Reset panel position" },
       ];
-      const splitHTML = `
-        <span data-action="split" style="flex:1; text-align:center; cursor:pointer; padding:3px 2px;
-              border-radius:4px; opacity:0.75;">✂️</span>`;
-      const tabsHTML = tabs.map((t) => `
-        <span data-session="${t.key}"
-          style="flex:1; text-align:center; padding:3px 2px; border-radius:4px; cursor:pointer;
-                 ${selectedSession === t.key ? "background:#4b3fa0;" : ""}
-                 opacity:${selectedSession === t.key ? "1" : (t.hasData ? "0.6" : "0.35")};">${t.label}</span>
-      `).join("");
-      toolbarEl.innerHTML = splitHTML + tabsHTML;
+      el.innerHTML = items.map((it) => `
+        <div data-menu="${it.key}" data-hover style="cursor:pointer; padding:5px 7px; border-radius:5px;
+             display:flex; justify-content:space-between; gap:8px; align-items:baseline;
+             ${it.danger ? "color:#e79a9a;" : ""}">
+          <span>${it.label}</span>
+          ${it.hint ? `<span style="opacity:0.45; font-size:10px;">${it.hint}</span>` : ""}
+        </div>`).join("");
 
-      toolbarEl.querySelector('[data-action="split"]').addEventListener("click", () => {
-        if (!currentSegment) {
-          alert("No segment is currently running (no active combat right now).");
-          return;
-        }
-        splitCurrentSegment();
-        renderPanel();
-      });
-      toolbarEl.querySelectorAll("[data-session]").forEach((el) => {
-        el.addEventListener("click", () => {
-          selectedSession = el.dataset.session;
+      el.querySelectorAll("[data-menu]").forEach((node) => {
+        node.addEventListener("click", () => {
+          const action = node.dataset.menu;
+          menuOpen = false;
+          if (action === "new" || action === "delete") deleteSelectedSession();
+          else if (action === "export") exportSelectedSession();
+          else if (action === "import") panel.querySelector("#ctp-import-file").click();
+          else if (action === "undo") undoImport();
+          else if (action === "dummy") loadDummyData();
+          else if (action === "resetpos") {
+            ui.left = null;
+            ui.top = 60;
+            persistUi();
+            applyPanelPosition();
+          }
           renderPanel();
         });
       });
+    }
 
-      // Reset/New icon changes meaning depending on which tab is selected.
-      const resetEl = panel.querySelector("#ctp-reset");
-      if (selectedSession === "current") {
-        resetEl.textContent = "🆕";
-        resetEl.title = "Start a new session now (archives the current one, nothing is lost)";
-      } else {
-        resetEl.textContent = "🗑️";
-        resetEl.title = "Permanently delete this archived session";
-      }
+    function renderTabs() {
+      const el = panel.querySelector("#ctp-tabs");
+      // "hasData" only dims a tab - an empty archived slot must stay clickable,
+      // since selecting it is the only way to import data into it.
+      const tabs = [
+        { key: "current", label: "Now", hasData: true },
+        { key: "prev1", label: "Prev", hasData: !!sessionHistory[0] },
+        { key: "prev2", label: "Older", hasData: !!sessionHistory[1] },
+      ];
+      el.innerHTML = tabs.map((t) => `
+        <span data-session="${t.key}" ${selectedSession === t.key ? "" : "data-hover"}
+          style="flex:1; text-align:center; padding:4px 2px; border-radius:5px; cursor:pointer;
+                 ${selectedSession === t.key ? "background:#4b3fa0;" : ""}
+                 opacity:${selectedSession === t.key ? "1" : (t.hasData ? "0.6" : "0.35")};">${t.label}</span>`).join("");
+      el.querySelectorAll("[data-session]").forEach((node) => {
+        node.addEventListener("click", () => {
+          selectedSession = node.dataset.session;
+          openCatSegId = null;
+          playerPickerSegId = null;
+          expandedGroups = new Set();
+          renderPanel();
+        });
+      });
+    }
 
-      const statusEl = panel.querySelector("#ctp-status");
+    function renderLive() {
+      const el = panel.querySelector("#ctp-live");
+      const sessionMs = sessionTotalMs();
+      const totalLine = `<span>${formatDuration(Math.round(sessionMs / 1000))} total</span>`;
+
       if (selectedSession !== "current") {
-        const idx = selectedSession === "prev1" ? 0 : 1;
-        const hist = sessionHistory[idx];
-        if (!hist) {
-          statusEl.innerHTML = `📦 No data in this slot yet<br>
-            <span style="opacity:0.7;">Import a session file to fill it, or it'll fill itself the next time a session archives.</span>`;
-        } else {
-          const when = new Date(hist.endedAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
-          statusEl.innerHTML = `📦 Archived session (ended ${when})<br>
-            <span style="opacity:0.7;">Total pause (real): ${formatDuration(totalPausedRealS())}</span>`;
-        }
-      } else {
-        const combat = game.combat;
-        const pausedTag = game.paused ? " ⏸ Paused" : "";
-        let next = "";
-        if (combat?.turns?.length) {
-          const n = combat.turns[(combat.turn + 1) % combat.turns.length];
-          if (n) next = ` · Next: ${escapeHtml(n.name)}`;
-        }
-        statusEl.innerHTML = `${combat ? "Combat active" : "No active combat"}${pausedTag}${next}<br>
-          <span style="opacity:0.7;">Total pause (real): ${formatDuration(totalPausedRealS())}</span>`;
+        const hist = sessionHistory[selectedSession === "prev1" ? 0 : 1];
+        el.innerHTML = hist
+          ? `<div style="display:flex; justify-content:space-between; font-size:11px; opacity:0.65;">
+               <span>📦 Archived · ended ${formatClock(hist.endedAt)}</span>${totalLine}
+             </div>
+             <div style="font-size:11px; opacity:0.5; margin-top:5px;">Read-only view. Tracking continues on “Now”.</div>`
+          : `<div style="font-size:11px; opacity:0.65;">📦 Nothing in this slot yet</div>
+             <div style="font-size:11px; opacity:0.5; margin-top:5px;">Import a session file here, or it fills itself the next time a session archives.</div>`;
+        return;
       }
 
-      const rowsEl = panel.querySelector("#ctp-rows");
-      const rows = perCombatantStats()
-        .sort((a, b) => b.totalMs - a.totalMs)
-        .map((e) => {
-          const s = Math.round(e.totalMs / 1000);
-          const avg = e.turnCount > 0 ? ` · Ø ${formatDuration(Math.round(s / e.turnCount))}` : "";
-          return `<div style="display:flex; align-items:center; gap:6px; padding:2px 0;">
-            <span style="width:8px; height:8px; border-radius:50%; background:${e.color}; flex-shrink:0;"></span>
-            <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-              🧑 ${escapeHtml(e.name)}
+      const combat = game.combat;
+      const turnCount = combat?.turns?.length ?? 0;
+      const where = combat
+        ? `Round ${combat.round ?? "–"}${turnCount ? ` · turn ${(combat.turn ?? 0) + 1} of ${turnCount}` : ""}`
+        : "No active combat";
+      const paused = game.paused ? ` <span style="color:#e8a33d;">⏸ paused</span>` : "";
+
+      let body = `<div style="font-size:11px; opacity:0.5; margin-top:6px;">Nothing is being tracked right now.</div>`;
+      if (currentSegment) {
+        const owner = resolvedOwner(currentSegment);
+        const color = isPlayerControlled(currentSegment) ? getCombatantColor(owner) : getCombatantColor(null);
+        const who = ownerName(owner);
+        body = `
+          <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
+            <span style="width:9px; height:9px; border-radius:50%; background:${color}; flex-shrink:0;"></span>
+            <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;">
+              ${escapeHtml(currentSegment.combatantName)}${who ? ` <span style="opacity:0.55; font-weight:400;">${escapeHtml(who)}</span>` : ""}
             </span>
-            <span style="opacity:0.85; font-size:11px;">${formatDuration(s)}${avg}</span>
+            <span id="ctp-live-dur" style="font-variant-numeric:tabular-nums;">${formatDuration(Math.round(segMs(currentSegment) / 1000))}</span>
+            <span id="ctp-split" data-hover title="Split the running segment right now"
+                  style="cursor:pointer; padding:4px 8px; border-radius:5px; border:1px solid #4a4a58; white-space:nowrap;">✂️ Split</span>
           </div>`;
-        }).join("");
-      rowsEl.innerHTML = rows || `<div style="opacity:0.5">–</div>`;
+      }
 
-      const agg = npcAggregate();
+      el.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:baseline; font-size:11px; opacity:0.65;">
+          <span>${where}${paused}</span>${totalLine}
+        </div>
+        ${body}`;
+
+      const splitBtn = el.querySelector("#ctp-split");
+      if (splitBtn) {
+        splitBtn.addEventListener("click", () => {
+          splitCurrentSegment();
+          toast("Segment split. The new one starts now.");
+          renderPanel();
+        });
+      }
+    }
+
+    // Every entry that appears in a total, in one place: players, the combined
+    // GM bucket, and the Team/Setup categories when they have any time at all.
+    // Shared by the panel summary and the chat bar chart so the two can never
+    // disagree about who is in the session.
+    function summaryEntries() {
+      const entries = perCombatantStats().map((e) => ({ ...e, icon: "🧑", kind: "player" }));
+      const gm = gmTotalStats();
       const cat = categoryTotals();
-      panel.querySelector("#ctp-footer").innerHTML = `
-        ${agg.turns ? `👹 Monsters total: ${formatDuration(agg.totalS)} · Ø ${formatDuration(agg.avgS)}/turn<br>` : ""}
-        🎲 GM: ${formatDuration(cat.dmS)} · 👥 Team: ${formatDuration(cat.teamS)} · 🛠️ Setup: ${formatDuration(cat.setupS)}
-      `;
+      if (gm.totalMs > 0) {
+        entries.push({ id: "gm-total", name: "GM", icon: "🎲", color: getCombatantColor(null), totalMs: gm.totalMs, turnCount: gm.turnCount, byEntity: gm.byEntity, kind: "gm" });
+      }
+      if (cat.teamMs > 0) {
+        entries.push({ id: "team-total", name: "Team", icon: "👥", color: TEAM_COLOR, totalMs: cat.teamMs, turnCount: 0, kind: "flat" });
+      }
+      if (cat.setupMs > 0) {
+        entries.push({ id: "setup-total", name: "Setup", icon: "🛠️", color: SETUP_COLOR, totalMs: cat.setupMs, turnCount: 0, kind: "flat" });
+      }
+      entries.sort((a, b) => b.totalMs - a.totalMs);
+      return entries;
+    }
 
-      const segEl = panel.querySelector("#ctp-segments");
-      const { segs: viewSegs, current: viewCurrent } = getSelectedSessionData();
-      const timeline = buildSegmentTimeline(viewSegs, viewCurrent);
-      segEl.innerHTML = timeline.length
-        ? timeline.map((item) => item.marker !== undefined ? roundMarkerHTML(item.marker) : segmentRowHTML(item.seg)).join("")
-        : `<div style="opacity:0.5; padding:6px 0; font-size:11px;">No data yet - import a session or wait for combat to start.</div>`;
-      segEl.querySelectorAll("[data-cat]").forEach((el) => {
-        el.addEventListener("click", () => {
-          const seg = findSegment(el.dataset.segId);
+    // Collapsed: one proportion strip answering "was this fight lopsided", plus
+    // the three biggest by name. Expanded: a labelled mini-bar per entry. The
+    // strip deliberately does not try to identify anyone - every slice carries
+    // a title tooltip, and the expanded state is the labelled view.
+    function renderSummary() {
+      const el = panel.querySelector("#ctp-summary");
+      const entries = summaryEntries();
+      if (!entries.length) {
+        el.innerHTML = `<div style="font-size:11px; opacity:0.5;">No tracked time yet.</div>`;
+        return;
+      }
+      const total = entries.reduce((sum, e) => sum + e.totalMs, 0) || 1;
+      const strip = entries.map((e) => `
+        <div title="${escapeHtml(e.name)} · ${formatDuration(Math.round(e.totalMs / 1000))} · ${pct(e.totalMs, total)}%"
+             style="width:${(e.totalMs / total) * 100}%; min-width:3px; background:${e.color};"></div>`).join("");
+
+      let detail = "";
+      if (ui.summaryOpen) {
+        const max = Math.max(1, ...entries.map((e) => e.totalMs));
+        detail = `<div style="margin-top:8px;">${entries.map((e) => `
+          <div style="display:flex; align-items:center; gap:7px; padding:2px 0; font-size:11px;">
+            <span style="width:56px; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(e.name)}</span>
+            <span style="flex:1; height:6px; border-radius:3px; background:rgba(255,255,255,0.07); overflow:hidden;">
+              <span style="display:block; height:100%; width:${Math.max(3, (e.totalMs / max) * 100)}%; background:${e.color};"></span>
+            </span>
+            <span style="width:46px; text-align:right; opacity:0.8; font-variant-numeric:tabular-nums;">${formatDuration(Math.round(e.totalMs / 1000))}</span>
+          </div>`).join("")}</div>`;
+      }
+
+      const top = entries.slice(0, 3)
+        .map((e) => `${escapeHtml(e.name)} ${formatDuration(Math.round(e.totalMs / 1000))}`).join(" · ");
+
+      el.innerHTML = `
+        <div style="display:flex; height:10px; border-radius:3px; overflow:hidden;">${strip}</div>
+        <div style="display:flex; justify-content:space-between; gap:8px; font-size:10px; opacity:0.6; margin-top:6px;">
+          <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${ui.summaryOpen ? `${entries.length} entries` : top}</span>
+          <span id="ctp-summary-toggle" style="cursor:pointer; opacity:0.85; flex-shrink:0;">Details ${ui.summaryOpen ? "▴" : "▾"}</span>
+        </div>
+        ${detail}`;
+
+      el.querySelector("#ctp-summary-toggle").addEventListener("click", () => {
+        ui.summaryOpen = !ui.summaryOpen;
+        persistUi();
+        renderPanel();
+      });
+    }
+
+    const SEG_FILTERS = [
+      { key: "all", label: "All" },
+      { key: "setup", label: "Setup" },
+      { key: "reassigned", label: "Reassigned" },
+      { key: "long", label: ">1m" },
+    ];
+    function segmentMatchesFilter(seg) {
+      if (segFilter === "setup") return seg.category === "setup" || seg.category === "ignore";
+      if (segFilter === "reassigned") return !!seg.overrideOwnerId || seg.category === "dm" || seg.category === "team";
+      if (segFilter === "long") return segMs(seg) >= 60_000;
+      return true;
+    }
+    function renderFilters() {
+      const el = panel.querySelector("#ctp-filters");
+      el.innerHTML = `<span style="opacity:0.5;">Filter</span>` + SEG_FILTERS.map((f) => `
+        <span data-filter="${f.key}" ${segFilter === f.key ? "" : "data-hover"}
+          style="cursor:pointer; padding:2px 7px; border-radius:9px;
+                 ${segFilter === f.key ? "background:#4b3fa0;" : "border:1px solid #3f3f4c; opacity:0.6;"}">${f.label}</span>`).join("");
+      el.querySelectorAll("[data-filter]").forEach((node) => {
+        node.addEventListener("click", () => {
+          segFilter = node.dataset.filter;
+          renderPanel();
+        });
+      });
+    }
+
+    // ---- Segment list --------------------------------------------------------
+
+    // Display-side grouping. Deliberately NOT buildTurnSlots(): that one drops
+    // "ignore" segments entirely (correct for statistics, useless here - you
+    // could never un-ignore one), and its slots are keyed for aggregation
+    // rather than for a stable DOM identity across renders.
+    function buildDisplayGroups() {
+      const groups = [];
+      for (const seg of allSegments()) {
+        if (!groups.length || isTurnStart(seg)) {
+          groups.push({ key: seg.id, opener: seg, round: seg.round, segments: [seg] });
+        } else {
+          groups[groups.length - 1].segments.push(seg);
+        }
+      }
+      return groups;
+    }
+    function groupTotalMs(g) {
+      return g.segments.reduce((sum, s) => sum + segMs(s), 0);
+    }
+    function groupIsLive(g) {
+      return g.segments.some((s) => s.end === null);
+    }
+
+    // The rebuild is skipped when nothing that affects the markup changed, so
+    // the list keeps its scroll position and any text selection instead of
+    // being thrown away once per second. Only the durations of the live
+    // segment/group tick, and those are patched in place.
+    function segmentSignature(groups) {
+      const parts = [selectedSession, segFilter, openCatSegId ?? "", playerPickerSegId ?? "", [...expandedGroups].sort().join(",")];
+      for (const g of groups) {
+        parts.push(`G${g.key}:${g.segments.length}`);
+        for (const s of g.segments) {
+          parts.push(`${s.id}:${s.category}:${s.overrideOwnerId ?? ""}:${s.end === null ? "live" : s.end}`);
+        }
+      }
+      return parts.join("|");
+    }
+
+    function categoryChipHTML(seg) {
+      const meta = CATEGORY_META[seg.category] ?? CATEGORY_META.player;
+      return `<span data-cat-open="${seg.id}" title="Change category"
+        style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px; white-space:nowrap;
+               background:${meta.bg}; color:${meta.fg};">${meta.label} ▾</span>`;
+    }
+
+    function categoryPickerHTML(seg) {
+      const cats = Object.entries(CATEGORY_META).map(([key, meta]) => {
+        const active = seg.category === key;
+        const label = key === "player" ? `${meta.label}…` : meta.label;
+        return `<span data-seg-id="${seg.id}" data-cat="${key}" ${active ? "" : "data-hover"}
+          style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px;
+                 ${active ? `background:${meta.bg}; color:${meta.fg};` : "border:1px solid #3f3f4c;"}">${label}</span>`;
+      }).join("");
+
+      let players = "";
+      if (playerPickerSegId === seg.id) {
+        const chips = getCombatPlayers().map((p) => `
+          <span data-seg-id="${seg.id}" data-owner-pick="${p.ownerId}"
+            style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px;
+                   background:${p.color}; color:${labelColorOn(p.color)};">${escapeHtml(p.name)}</span>`).join("");
+        players = `
+          <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:5px;">
+            <span data-seg-id="${seg.id}" data-owner-pick="__default__" data-hover
+              style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px;
+                     border:1px dashed rgba(255,255,255,0.35); opacity:0.75;">↩ Default</span>
+            ${chips}
+          </div>`;
+      }
+      return `<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:5px;">${cats}</div>${players}`;
+    }
+
+    function segRowHTML(seg) {
+      const live = seg.end === null;
+      const triggerIcon = seg.trigger === "pause" ? "⏸ "
+        : seg.trigger === "split" ? "✂️ "
+        : (seg.trigger === "unpause" || seg.trigger === "resume") ? "▶ " : "";
+      const who = seg.combatantId ? escapeHtml(seg.combatantName) : "(no combat)";
+      const override = seg.overrideOwnerId
+        ? ` <span style="color:${getCombatantColor(seg.overrideOwnerId)};">→ ${escapeHtml(ownerName(seg.overrideOwnerId))}</span>`
+        : "";
+      const defeated = seg.defeated ? " 💀" : "";
+      const dur = formatDuration(Math.round(segMs(seg) / 1000));
+      return `
+        <div style="padding:4px 0;">
+          <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
+            <span style="opacity:0.45; font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0;">${formatClock(seg.start)}</span>
+            <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+              ${triggerIcon}${who}${override}${defeated}${live ? " ●" : ""}
+            </span>
+            <span ${live ? `data-live-dur="${seg.id}"` : ""} style="opacity:0.85; font-variant-numeric:tabular-nums; flex-shrink:0;">${dur}</span>
+            ${categoryChipHTML(seg)}
+          </div>
+          ${openCatSegId === seg.id ? categoryPickerHTML(seg) : ""}
+        </div>`;
+    }
+
+    function groupHTML(g, expanded) {
+      const opener = g.opener;
+      const owner = resolvedOwner(opener);
+      const isPC = isPlayerControlled(opener);
+      const who = ownerName(owner);
+      const dot = isPC
+        ? `<span style="width:8px; height:8px; border-radius:50%; background:${getCombatantColor(owner)}; flex-shrink:0;"></span>`
+        : `<span style="flex-shrink:0;">👹</span>`;
+      const live = groupIsLive(g);
+      const total = formatDuration(Math.round(groupTotalMs(g) / 1000));
+
+      // A slot that never got split is one segment, so a header plus a single
+      // child would print the same name and duration twice. Render it as one
+      // row that carries the category chip directly - no expanding needed to
+      // reach the only thing there is to edit.
+      if (g.segments.length === 1) {
+        const seg = g.segments[0];
+        return `
+          <div style="border-bottom:1px solid rgba(255,255,255,0.05); padding:6px 10px;">
+            <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
+              <span style="opacity:0.45; font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0;">${formatClock(seg.start)}</span>
+              ${dot}
+              <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                ${escapeHtml(seg.combatantName)}${who ? ` <span style="opacity:0.45;">${escapeHtml(who)}</span>` : ""}
+                ${seg.overrideOwnerId ? ` <span style="color:${getCombatantColor(seg.overrideOwnerId)};">→ ${escapeHtml(ownerName(seg.overrideOwnerId))}</span>` : ""}
+                ${seg.defeated ? " 💀" : ""}${live ? " ●" : ""}
+              </span>
+              <span ${live ? `data-live-dur="${seg.id}"` : ""} style="font-variant-numeric:tabular-nums; flex-shrink:0; opacity:0.85;">${total}</span>
+              ${categoryChipHTML(seg)}
+            </div>
+            ${openCatSegId === seg.id ? categoryPickerHTML(seg) : ""}
+          </div>`;
+      }
+
+      const header = `
+        <div data-group-row data-group="${g.key}" style="display:flex; align-items:center; gap:6px;
+             padding:6px 10px; font-size:11px; cursor:pointer;">
+          <span style="opacity:0.5; width:9px; flex-shrink:0;">${expanded ? "▾" : "▸"}</span>
+          ${dot}
+          <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+            ${escapeHtml(opener.combatantName)}${who ? ` <span style="opacity:0.45;">${escapeHtml(who)}</span>` : ""}
+            <span style="opacity:0.4;"> · ${g.segments.length} parts</span>
+            ${live ? " ●" : ""}
+          </span>
+          <span ${live ? `data-group-dur="${g.key}"` : ""} style="font-variant-numeric:tabular-nums; flex-shrink:0;">${total}</span>
+        </div>`;
+
+      if (!expanded) return `<div style="border-bottom:1px solid rgba(255,255,255,0.05);">${header}</div>`;
+
+      const children = g.segments.map((s) => segRowHTML(s)).join("");
+      return `
+        <div style="border-bottom:1px solid rgba(255,255,255,0.05); background:#1b1b23;">
+          ${header}
+          <div style="margin:0 10px 6px 22px; border-left:2px solid #33333f; padding-left:8px;">${children}</div>
+        </div>`;
+    }
+
+    function renderSegments() {
+      const host = panel.querySelector("#ctp-segments");
+      let groups = buildDisplayGroups();
+      const filtering = segFilter !== "all";
+      if (filtering) {
+        groups = groups
+          .map((g) => ({ ...g, segments: g.segments.filter(segmentMatchesFilter) }))
+          .filter((g) => g.segments.length);
+      }
+
+      const sig = segmentSignature(groups);
+      if (sig === lastSegSig) {
+        // Nothing structural changed - only patch the two things that tick.
+        host.querySelectorAll("[data-live-dur]").forEach((node) => {
+          const seg = findSegment(node.dataset.liveDur);
+          if (seg) node.textContent = formatDuration(Math.round(segMs(seg) / 1000));
+        });
+        host.querySelectorAll("[data-group-dur]").forEach((node) => {
+          const g = groups.find((x) => x.key === node.dataset.groupDur);
+          if (g) node.textContent = formatDuration(Math.round(groupTotalMs(g) / 1000));
+        });
+        return;
+      }
+      lastSegSig = sig;
+
+      if (!groups.length) {
+        host.innerHTML = `<div style="opacity:0.5; padding:10px; font-size:11px;">${
+          filtering ? "Nothing matches this filter." : "No data yet — import a session, or wait for combat to start."
+        }</div>`;
+        return;
+      }
+
+      // Newest first, chronological inside a group. Round markers are emitted
+      // as the (reversed) walk crosses a round boundary.
+      const ordered = [...groups].reverse();
+      let html = "";
+      ordered.forEach((g, i) => {
+        const nextRound = ordered[i + 1]?.round ?? null;
+        // A filtered group can be auto-expanded: hiding a match behind a
+        // collapsed header would defeat the point of filtering for it.
+        const expanded = filtering || expandedGroups.has(g.key) || groupIsLive(g);
+        html += groupHTML(g, expanded);
+        if (g.round != null && nextRound !== g.round) {
+          html += `
+            <div style="padding:4px 10px; font-size:10px; letter-spacing:0.5px; opacity:0.5; background:#1d1d25;">
+              🔄 ROUND ${g.round}
+            </div>`;
+        }
+      });
+
+      const scroll = host.scrollTop;
+      host.innerHTML = html;
+      host.scrollTop = scroll;
+
+      host.querySelectorAll("[data-group]").forEach((node) => {
+        node.addEventListener("click", () => {
+          const key = node.dataset.group;
+          if (expandedGroups.has(key)) expandedGroups.delete(key);
+          else expandedGroups.add(key);
+          openCatSegId = null;
+          playerPickerSegId = null;
+          renderPanel();
+        });
+      });
+      host.querySelectorAll("[data-cat-open]").forEach((node) => {
+        node.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const id = node.dataset.catOpen;
+          openCatSegId = openCatSegId === id ? null : id;
+          playerPickerSegId = null;
+          renderPanel();
+        });
+      });
+      host.querySelectorAll("[data-cat]").forEach((node) => {
+        node.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const seg = findSegment(node.dataset.segId);
           if (!seg) return;
-          const cat = el.dataset.cat;
+          const cat = node.dataset.cat;
           if (cat === "player") {
-            // Don't assign immediately - open the picker so a specific
-            // player can be chosen instead of always the technical owner.
+            // Don't assign straight away - open the player list, so the time
+            // can go to somebody other than the technical owner.
             playerPickerSegId = playerPickerSegId === seg.id ? null : seg.id;
             renderPanel();
             return;
@@ -1372,19 +1922,64 @@
           seg.category = cat;
           seg.overrideOwnerId = null;
           playerPickerSegId = null;
+          openCatSegId = null;
+          persist();
+          toast(`Marked as ${CATEGORY_META[cat].label}.`);
           renderPanel();
         });
       });
-      segEl.querySelectorAll("[data-owner-pick]").forEach((el) => {
-        el.addEventListener("click", () => {
-          const seg = findSegment(el.dataset.segId);
+      host.querySelectorAll("[data-owner-pick]").forEach((node) => {
+        node.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const seg = findSegment(node.dataset.segId);
           if (!seg) return;
+          const pick = node.dataset.ownerPick;
           seg.category = "player";
-          seg.overrideOwnerId = el.dataset.ownerPick === "__default__" ? null : el.dataset.ownerPick;
+          seg.overrideOwnerId = pick === "__default__" ? null : pick;
           playerPickerSegId = null;
+          openCatSegId = null;
+          persist();
+          toast(pick === "__default__" ? "Back to the default owner." : `Reassigned to ${ownerName(pick)}.`);
           renderPanel();
         });
       });
+    }
+
+    function renderPostMenu() {
+      const el = panel.querySelector("#ctp-post-menu");
+      el.style.display = postMenuOpen ? "block" : "none";
+      if (!postMenuOpen) return;
+      const options = [
+        { key: "bars", label: "📊 Bar chart — time per person" },
+        { key: "players", label: "🧑 Player list — turn, gap, wait" },
+      ];
+      el.innerHTML = `
+        <div style="border:1px solid #3a3a46; border-radius:6px; overflow:hidden;">
+          ${options.map((o) => `
+            <div data-post="${o.key}" data-hover style="cursor:pointer; padding:6px 8px; font-size:11px;">${o.label}</div>`).join("")}
+        </div>
+        <div style="font-size:10px; opacity:0.45; margin:4px 2px 0;">Whispered to you. Right-click the message → “Reveal to Everyone” to share.</div>`;
+      el.querySelectorAll("[data-post]").forEach((node) => {
+        node.addEventListener("click", async () => {
+          const kind = node.dataset.post;
+          postMenuOpen = false;
+          renderPanel();
+          await postToChat(kind === "bars" ? buildBarsContent() : buildPlayerListContent(), kind);
+          toast("Posted to chat — only you can see it.");
+        });
+      });
+    }
+
+    function renderPanel() {
+      persist();
+      if (!panelVisible || !document.body.contains(panel)) return;
+      renderMenu();
+      renderTabs();
+      renderLive();
+      renderSummary();
+      renderFilters();
+      renderSegments();
+      renderPostMenu();
     }
 
     setInterval(renderPanel, 1000);

@@ -2,7 +2,7 @@
 
 A Tampermonkey userscript for [Foundry VTT](https://foundryvtt.com/) that tracks how much time each player — and the GM — spends during combat. Runs entirely in your own browser: no module installation, no GM permission needed, nothing written to the server.
 
-> Built with [Claude Sonnet 5](https://claude.ai/) (Anthropic).
+> Built with [Claude Sonnet 5 and Claude Opus 5](https://claude.ai/) (Anthropic).
 
 ## What it does
 
@@ -46,20 +46,23 @@ The panel opens automatically. If you close it (✕), a small reopen button appe
 
 ### The panel
 
-- **🆕 / 🗑️** (top right): starts a new session (archiving the current one) when you're viewing "Now", or permanently deletes an archived session when viewing "-1"/"-2".
-- **🧪**: loads randomized dummy data (3 players, 3 monsters, 3 rounds) so you can try out the panel and chat reports without a live combat. Only works when the current session is empty.
-- **✕**: hides the panel (use the reopen button on the left edge to bring it back).
-- **Session tabs** (🟢 Now / 📦 -1 / 📦 -2): switch which session's data is shown and posted to chat. Greyed-out tabs have no data yet, but you can still open one — that's how you get an empty "-1"/"-2" slot ready to receive an import.
-- **✂️**: splits the currently running segment right now, e.g. to carve out a reaction or interrupt mid-turn so it can be categorized separately.
-- **📤 Export / 📥 Import**: save whichever session tab (Now / -1 / -2) you're currently viewing to a JSON file, or load one back in. Import replaces that tab's data outright — there's a confirmation prompt, but no undo, so export first if you're unsure. Handy for backing up a session, or moving one to a different browser/computer.
-- **Segment list**: every tracked slice of time for the whole session (scroll for older ones), each with five small icons (🧑 Player / 🎲 GM / 👥 Team / 🛠️ Setup / 🚫 Ignore) to change its category. Tapping 🧑 opens a picker so you can assign that time to *any* player, not just whoever's turn it technically was. **🚫 Ignore** excludes a slice from every total and every player's stats entirely — for when the session picks back up days later and a segment ends up spanning that whole real-world gap: split it off with ✂️ first, then mark the now-closed, days-long segment 🚫. A "🔄 Round N" marker appears wherever a new round starts.
+Top to bottom, the panel reads in the order things are scoped:
+
+- **Header**: `⋯` opens the actions menu (new session, delete an archived one, export, import, undo the last import, dummy data, reset the panel's position). `✕` hides the panel — a small `⚔️` button appears on the left edge of the screen to bring it back. Drag the header to move the panel; its position is remembered.
+- **Session tabs** (Now / Prev / Older): switch which session is shown and which one a chat report covers. A greyed-out tab has no data yet, but you can still open it — that's how you get an empty slot ready to receive an import.
+- **Live line**: the current round and turn, the session total, and whoever is on the clock right now with their running time. **✂️ Split** cuts the running segment in two right there, e.g. to carve out a reaction mid-turn so it can be categorized separately.
+- **Summary**: one bar showing how the session's time divides up. Hover a slice for the name and total. **Details** expands it into a labelled list of everyone, plus the Team and Setup categories when they have any time.
+- **Filter**: narrows the segment list to Setup/Ignore, to anything you've reassigned, or to segments over a minute.
+- **Segment list**: every tracked slice of time for the session, newest first, grouped by turn. A turn that was never split is a single row; one that was split collapses into a `▸ 3 parts` row you can open. Each segment shows its start time, who it belongs to, its duration, and a category chip — click the chip to change it to **Player**, **GM**, **Team**, **Setup**, or **Ignore**. Choosing *Player…* lets you hand the time to any player, not just whoever's turn it technically was (an Attack of Opportunity, say). **Ignore** drops a slice out of every total — for when the session picks back up days later and one segment ends up spanning the whole real-world gap: split it with ✂️ first, then mark the now-closed, days-long segment Ignore.
+- **Drag the handle** under the list to make the segment list taller or shorter. The size is remembered.
+- **Post report**: pick the bar chart or the player list. Both go to chat as a whisper to yourself.
 
 ### Chat reports
 
-Two buttons post a report to chat, visible only to you at first ("self roll" / whisper to yourself). Right-click your own message in the chat log and choose **Reveal to Everyone** if you want to share it — Foundry handles that natively, no extra step needed on our side.
+The Post report button offers two reports, visible only to you at first ("self roll" / whisper to yourself). Right-click your own message in the chat log and choose **Reveal to Everyone** if you want to share it — Foundry handles that natively, no extra step needed on our side.
 
-- **📊 Post bar chart**: total time per player plus one combined GM bar, sorted by time spent, with a percentage of the session total next to each. If a player controls more than one token (a character plus a familiar or summon), their bar splits into one segment per token — their own character always rightmost in their full color, other tokens trailing to the left in progressively darker shades. A thin second row appears under a player's bar whenever they have any paused or reassigned ("out-of-turn") time, breaking each token's segment down further so you can see at a glance how much of it was normal turn time versus a pause or a reassignment.
-- **🧑 Post player list**: per player, average turn length, average gap between their turns, and total time spent waiting.
+- **Bar chart**: total time per player plus one combined GM bar, sorted by time spent, with a percentage of the session total next to each. If a player controls more than one token (a character plus a familiar or summon), their bar splits into one segment per token — their own character always rightmost in their full color, other tokens trailing to the left in progressively darker shades, labelled by name where they're wide enough. Past four tokens the smallest are merged into a single "+N more" segment, since more shades than that stop being tellable apart. A thin second row appears under a player's bar whenever they have any paused or reassigned ("out-of-turn") time, breaking each token's segment down further so you can see at a glance how much of it was normal turn time versus a pause or a reassignment; a small legend under the chart says which colour is which.
+- **Player list**: per player, average turn length, average gap between their turns, and total time spent waiting.
 
 ### A new combat, a new session
 
