@@ -3,7 +3,7 @@
 // @namespace    https://local.private/
 // @version      0.2
 // @author       DerJJ/Umek
-// @description  Persistent, segmented combat time tracking with a session ring buffer (current + last 2), automatic new session on combat start, dummy data button, scene controls toggle, Player/GM/Team/Setup categorization, player/GM colors, owner-based grouping, defeated filter, two self-roll chat reports (dnd5e & pf2e)
+// @description  Persistent, segmented combat time tracking with a session ring buffer (current + last 2), automatic new session on combat start, dummy data button, Player/GM/Team/Setup/Ignore categorization, player/GM colors, owner-based grouping, defeated filter, two self-roll chat reports (dnd5e & pf2e)
 // @match        https://YOUR-SERVER-1.example.com/*
 // @match        https://YOUR-SERVER-2.example.com/*
 // @match        https://YOUR-SERVER-3.example.com/*
@@ -161,7 +161,7 @@
         combatantId: null,
         combatantName: "–",
         actorId: null, // stable across the encounter (and across sessions), unlike combatantId
-        actorType: null, // combatant.actor.type ("character" vs "npc" in dnd5e/pf2e) - distinguishes a PC from a player-owned summon/pet, which "ownerId !== null" alone can't
+        actorType: null, // combatant.actor.type - raw value, stored as-is; see isPcActorType() for what counts as "a real PC" vs a player-owned summon/pet, which "ownerId !== null" alone can't distinguish
         ownerId: null,
         overrideOwnerId: null, // manual reassignment to a specific player, wins over ownerId
         defeated: false,
@@ -333,12 +333,23 @@
     function isPlayerControlled(seg) {
       return resolvedOwner(seg) !== null;
     }
+    // dnd5e/pf2e-specific: the Actor "type" value that means "a real player
+    // character", as opposed to an NPC/summon - ownership alone can't tell
+    // them apart, since a player-owned summon still has an NPC-shaped actor.
+    // Not generalized to other systems (this script doesn't support any),
+    // but kept as one place to extend if that ever changes, instead of the
+    // same literal string duplicated at every call site that cares (N-08).
+    const PC_ACTOR_TYPE = "character";
+    function isPcActorType(actorType) {
+      return actorType === PC_ACTOR_TYPE;
+    }
+
     // A defeated PC still gets a real turn (death saves etc. are genuine
     // activity); a defeated NPC's turn is an instant skip - nobody actually
     // decided anything, so it never counts as "a turn" for averaging,
     // regardless of who its time ends up credited to (see effectiveOwner()).
     function isRealTurn(seg) {
-      return hasCombatContext(seg) && (!seg.defeated || seg.actorType === "character");
+      return hasCombatContext(seg) && (!seg.defeated || isPcActorType(seg.actorType));
     }
     // For each combatantId, who resolvedOwner() credited its most recent real
     // (non-instant-skip) turn to. Recomputed fresh every time - not cached -
@@ -447,11 +458,6 @@
         dmMs: t.dm, teamMs: t.team, setupMs: t.setup,
         dmS: Math.round(t.dm / 1000), teamS: Math.round(t.team / 1000), setupS: Math.round(t.setup / 1000),
       };
-    }
-
-    function totalPausedRealS() {
-      const ms = allSegments().filter((s) => s.trigger === "pause").reduce((sum, s) => sum + segMs(s), 0);
-      return Math.round(ms / 1000);
     }
 
     // Partitions the whole timeline into turn slots, independent of who ends
@@ -588,21 +594,24 @@
     const randomPauseDurationMs = () => randomGaussianDurationMs(30_000, 60_000);
 
     // Real players if the world actually has a GM plus at least 3 players
-    // configured - otherwise nobody to draw from, so fall back to fixed
-    // placeholder names. When real data is used, ALL non-GM users are
-    // included (not capped at 3). Colors are always resolved fresh from
-    // ownerId at render time (getCombatantColor()), never stored here.
+    // configured - otherwise nobody to draw from. When real data is used,
+    // ALL non-GM users are included (not capped at 3). Colors are always
+    // resolved fresh from ownerId at render time (getCombatantColor()),
+    // never stored here.
     function getDummyPlayerSource() {
       const realPlayers = game.users.filter((u) => !u.isGM);
       const gmExists = game.users.some((u) => u.isGM);
       if (gmExists && realPlayers.length >= 3) {
         return realPlayers.map((u) => ({ name: u.name, ownerId: u.id }));
       }
-      return [
-        { name: "Aria", ownerId: "dummy-p1" },
-        { name: "Boro", ownerId: "dummy-p2" },
-        { name: "Cass", ownerId: "dummy-p3" },
-      ];
+      // Not enough real players to draw 3 distinct ones - keep the fixed
+      // placeholder character names, but cycle ownerId through whichever
+      // real users actually exist (players first, then anyone at all)
+      // instead of an invented id no game.users entry matches - otherwise
+      // ownerName()/getCombatantColor() can't resolve it and every owner
+      // display falls back to "?" and grey (N-01).
+      const pool = realPlayers.length ? realPlayers : game.users.filter(() => true);
+      return ["Aria", "Boro", "Cass"].map((name, i) => ({ name, ownerId: pool[i % pool.length]?.id ?? null }));
     }
 
     function generateDummySegments() {
@@ -625,7 +634,7 @@
       for (let round = 0; round < 3; round++) {
         for (const [turnIndex, entry] of order.entries()) {
           const isPC = !!entry.ownerId;
-          const actorType = isPC ? "character" : "npc";
+          const actorType = isPC ? PC_ACTOR_TYPE : "npc";
           const dur = randomTurnDurationMs();
           out.push(makeSegment({
             start: t, end: t + dur, trigger: "turn",
@@ -720,11 +729,18 @@
     // Computed as real hex values rather than a CSS filter, since a filter
     // is easier for an aggressive Foundry/system theme to override, and
     // hard constraint #2 wants every color fully inline and self-contained.
+    // Shared by darkenHex() and relLuminance() - parses "#rrggbb" (or
+    // "rrggbb") into [r, g, b] ints, or null if it doesn't match.
+    function parseHexRgb(hex) {
+      const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex ?? "");
+      return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
+    }
+
     function darkenHex(hex, factor) {
-      const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex);
-      if (!m) return hex;
-      const scale = (h) => Math.round(parseInt(h, 16) * factor).toString(16).padStart(2, "0");
-      return `#${scale(m[1])}${scale(m[2])}${scale(m[3])}`;
+      const rgb = parseHexRgb(hex);
+      if (!rgb) return hex;
+      const scale = (c) => Math.round(c * factor).toString(16).padStart(2, "0");
+      return `#${rgb.map(scale).join("")}`;
     }
 
     // Orders a list of per-entity items so the "primary" one (a player's own
@@ -766,6 +782,7 @@
       const mergedItem = {
         combatantId: "__more__",
         name: `+${merged.length} more`,
+        mergedNames: merged.map((it) => it.name), // for the merged slice's tooltip
         actorType: null,
         ms: sum("ms"),
         inTurnMs: sum("inTurnMs"),
@@ -797,7 +814,7 @@
         const label = text
           ? `<span style="font-size:8px; font-weight:600; color:${labelColorOn(p.color)} !important; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:0 2px;">${text}</span>`
           : "";
-        return `<div style="width:${w}%; height:100%; background:${p.color} !important;
+        return `<div ${p.title ? `title="${escapeHtml(p.title)}"` : ""} style="width:${w}%; height:100%; background:${p.color} !important;
                      box-shadow:inset 0 1px 0 rgba(255,255,255,0.25) !important;
                      display:flex; align-items:center; justify-content:center; overflow:hidden;">${label}</div>`;
       }).join("");
@@ -809,8 +826,8 @@
     // ordinary single-entity player with no paused/out-of-turn time this
     // degenerates to exactly today's single solid bar with no indicator row.
     function buildPlayerBarRows(e) {
-      const entities = capEntities(e.byEntity, (en) => en.inTurnMs + en.outOfTurnMs, (en) => en.actorType === "character");
-      const ordered = orderAndShade(entities, (en) => en.actorType === "character")
+      const entities = capEntities(e.byEntity, (en) => en.inTurnMs + en.outOfTurnMs, (en) => isPcActorType(en.actorType));
+      const ordered = orderAndShade(entities, (en) => isPcActorType(en.actorType))
         .map(({ item, shade }) => ({ item, color: darkenHex(e.color, shade) }));
       const showLabels = ordered.length > 1;
       const personTotalMs = entities.reduce((sum, en) => sum + en.inTurnMs + en.outOfTurnMs, 0) || 1;
@@ -823,6 +840,8 @@
         label: showLabels ? escapeHtml(item.name) : null,
         labelPct: 28,
         altLabel: showLabels ? formatDuration(Math.round((item.inTurnMs + item.outOfTurnMs) / 1000)) : null,
+        // The capped "+N more" slice otherwise names nobody it actually swallowed.
+        title: item.mergedNames ? item.mergedNames.join(", ") : null,
       }));
       const mainSegs = proportionalSegmentsHtml(mainParts, 12);
 
@@ -866,6 +885,7 @@
         label: showLabels ? escapeHtml(item.name) : null,
         labelPct: 28,
         altLabel: showLabels ? formatDuration(Math.round(item.ms / 1000)) : null,
+        title: item.mergedNames ? item.mergedNames.join(", ") : null,
       }));
       return proportionalSegmentsHtml(parts, 12);
     }
@@ -1166,10 +1186,10 @@
     // base color, so a single hardcoded label color is unreadable on roughly
     // half of them.
     function relLuminance(hex) {
-      const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex ?? "");
-      if (!m) return 0.5;
-      const lin = [1, 2, 3].map((i) => {
-        const c = parseInt(m[i], 16) / 255;
+      const rgb = parseHexRgb(hex);
+      if (!rgb) return 0.5;
+      const lin = rgb.map((c8) => {
+        const c = c8 / 255;
         return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
       });
       return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
