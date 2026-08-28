@@ -2131,30 +2131,51 @@
       return `<div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:5px;">${cats}</div>${players}`;
     }
 
+    // What a segment's row should read as - shared by segRowHTML() and
+    // groupHTML(). "player" (or a genuinely unowned combatant's own "gm"
+    // turn - still real activity, just landing in the GM bucket) shows the
+    // technical combatant, or whoever it was manually reassigned to via
+    // overrideOwnerId. Anything else - setup/team/ignore, or a "gm"
+    // recategorization of an OWNED turn - isn't that combatant's own
+    // activity at all, it's a category of time, not a person's, so the
+    // category's own label becomes the primary text instead (e.g. a
+    // monster's turn split off as GM rules-lookup time reads as "GM", not
+    // as if the monster were still doing something) - the technical
+    // combatant is demoted to the same muted "(from ...)" note an actual
+    // reassignment gets. `fallbackWho` (the account behind a still-genuine,
+    // non-reassigned segment's technical owner) is only ever shown in that
+    // one case; every other case's secondary note is always the raw
+    // combatant name.
+    function segmentDisplayName(seg, technicalName, fallbackWho) {
+      const isGenuineActivity = seg.category === "player" || (seg.category === "gm" && seg.ownerId == null);
+      if (!isGenuineActivity) {
+        return { primary: CATEGORY_META[seg.category]?.label ?? technicalName, secondary: technicalName, isNote: true };
+      }
+      if (seg.overrideOwnerId) {
+        return { primary: ownerName(seg.overrideOwnerId), secondary: technicalName, isNote: true };
+      }
+      return { primary: technicalName, secondary: fallbackWho, isNote: false };
+    }
+
     function segRowHTML(seg) {
       const live = seg.end === null;
       const triggerIcon = seg.trigger === "pause" ? "⏸ "
         : seg.trigger === "split" ? "✂️ "
         : (seg.trigger === "unpause" || seg.trigger === "resume") ? "▶ " : "";
       const technicalName = seg.combatantId ? seg.combatantName : "(no combat)";
-      // A manually reassigned segment reads primarily as whoever it's NOW
-      // credited to, not the technical combatant it structurally came from -
-      // the origin is still shown, just demoted to a muted secondary note
-      // instead of the main label, so the row doesn't look like it's still
-      // that combatant's own time.
-      const primaryName = seg.overrideOwnerId ? ownerName(seg.overrideOwnerId) : technicalName;
-      const origin = seg.overrideOwnerId
-        ? ` <span style="opacity:0.45;">(from ${escapeHtml(technicalName)})</span>`
+      const { primary, secondary, isNote } = segmentDisplayName(seg, technicalName, null);
+      const origin = secondary
+        ? ` <span style="opacity:0.45;">${isNote ? `(from ${escapeHtml(secondary)})` : escapeHtml(secondary)}</span>`
         : "";
       const defeated = seg.defeated ? " 💀" : "";
       const dur = formatDuration(Math.round(segMs(seg) / 1000));
-      const fullText = seg.overrideOwnerId ? `${primaryName} (from ${technicalName})` : primaryName;
+      const fullText = secondary ? `${primary} ${isNote ? `(from ${secondary})` : secondary}` : primary;
       return `
         <div data-anchor-seg="${seg.id}" style="padding:4px 0;">
           <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
             <span style="opacity:0.45; font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0;">${formatClock(seg.start)}</span>
             <span title="${escapeHtml(fullText)}" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-              ${triggerIcon}${escapeHtml(primaryName)}${origin}${defeated}${live ? " ●" : ""}
+              ${triggerIcon}${escapeHtml(primary)}${origin}${defeated}${live ? " ●" : ""}
             </span>
             <span ${live ? `data-live-dur="${seg.id}"` : ""} style="opacity:0.85; font-variant-numeric:tabular-nums; flex-shrink:0;">${dur}</span>
             ${categoryChipHTML(seg)}
@@ -2182,16 +2203,11 @@
       if (g.segments.length === 1) {
         const seg = g.segments[0];
         const total = formatDuration(Math.round(segMs(seg) / 1000));
-        // `who` already resolves overrideOwnerId (via resolvedOwner()), so a
-        // reassigned segment now reads primarily as whoever it's credited to
-        // - the technical combatant is demoted to a muted "(from ...)" note
-        // instead of a second, redundant mention of the same assignee.
-        const primaryName = seg.overrideOwnerId ? who : seg.combatantName;
-        const secondaryName = seg.overrideOwnerId ? seg.combatantName : who;
+        const { primary: primaryName, secondary: secondaryName, isNote } = segmentDisplayName(seg, seg.combatantName, who);
         const secondary = secondaryName
-          ? ` <span style="opacity:0.45;">${seg.overrideOwnerId ? `(from ${escapeHtml(secondaryName)})` : escapeHtml(secondaryName)}</span>`
+          ? ` <span style="opacity:0.45;">${isNote ? `(from ${escapeHtml(secondaryName)})` : escapeHtml(secondaryName)}</span>`
           : "";
-        const fullText = secondaryName ? `${primaryName} ${seg.overrideOwnerId ? `(from ${secondaryName})` : secondaryName}` : primaryName;
+        const fullText = secondaryName ? `${primaryName} ${isNote ? `(from ${secondaryName})` : secondaryName}` : primaryName;
         return `
           <div data-anchor-group="${g.key}" style="border-bottom:1px solid rgba(255,255,255,0.05); padding:6px 10px;">
             <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
@@ -2244,17 +2260,16 @@
            </span>`
         : "";
       // Same primary/secondary swap as the single-segment row above, driven
-      // by the OPENER's own override - a child segment elsewhere in the
-      // group being reassigned is already flagged by the composition chip,
-      // and shows correctly once expanded, without changing what the
-      // collapsed header's own name line says.
-      const openerPrimary = opener.overrideOwnerId ? who : opener.combatantName;
-      const openerSecondaryName = opener.overrideOwnerId ? opener.combatantName : who;
+      // by the OPENER's own category/override - a child segment elsewhere in
+      // the group being reassigned or recategorized is already flagged by
+      // the composition chip, and shows correctly once expanded, without
+      // changing what the collapsed header's own name line says.
+      const { primary: openerPrimary, secondary: openerSecondaryName, isNote: openerIsNote } = segmentDisplayName(opener, opener.combatantName, who);
       const openerSecondary = openerSecondaryName
-        ? ` <span style="opacity:0.45;">${opener.overrideOwnerId ? `(from ${escapeHtml(openerSecondaryName)})` : escapeHtml(openerSecondaryName)}</span>`
+        ? ` <span style="opacity:0.45;">${openerIsNote ? `(from ${escapeHtml(openerSecondaryName)})` : escapeHtml(openerSecondaryName)}</span>`
         : "";
       const headerFullText = openerSecondaryName
-        ? `${openerPrimary} ${opener.overrideOwnerId ? `(from ${openerSecondaryName})` : openerSecondaryName} · ${partsLabel}`
+        ? `${openerPrimary} ${openerIsNote ? `(from ${openerSecondaryName})` : openerSecondaryName} · ${partsLabel}`
         : `${openerPrimary} · ${partsLabel}`;
       const header = `
         <div data-group-row data-group="${g.key}" data-anchor-group="${g.key}" style="display:flex; align-items:center; gap:6px;
