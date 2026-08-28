@@ -83,7 +83,6 @@
     let currentSegment = null;  // current session: the running segment
     let sessionHistory = [];    // ring buffer: last 2 finished sessions, newest first
     let panelVisible = true;
-    let dragOffset = null;
 
     const saved = loadPersisted();
     if (saved) {
@@ -104,8 +103,31 @@
       return owner?.id ?? null;
     }
 
+    // Deterministic fallback color for an owner id that doesn't resolve to a
+    // real, currently-known Foundry user - a synthetic dummy-data id (see
+    // getDummyPlayerSource()), or a real id from an imported session that
+    // isn't in THIS world's roster (a player who left, or data imported from
+    // a different game). Hashing the id itself keeps the color stable across
+    // renders and reloads with no state to persist, and two different
+    // unresolvable ids reliably land on two different colors instead of
+    // every one of them collapsing onto the same flat grey.
+    function hashToHex(str) {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) | 0;
+      const hue = Math.abs(hash) % 360;
+      return hslToHex(hue, 55, 55);
+    }
+    function hslToHex(h, s, l) {
+      s /= 100; l /= 100;
+      const k = (n) => (n + h / 30) % 12;
+      const a = s * Math.min(l, 1 - l);
+      const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+      const toHex = (n) => Math.round(f(n) * 255).toString(16).padStart(2, "0");
+      return `#${toHex(0)}${toHex(8)}${toHex(4)}`;
+    }
+
     function getCombatantColor(ownerId) {
-      if (ownerId) return game.users.get(ownerId)?.color.css ?? "#888888";
+      if (ownerId) return game.users.get(ownerId)?.color.css ?? hashToHex(ownerId);
       const gm = game.users.find((u) => u.isGM && u.active) ?? game.users.find((u) => u.isGM);
       return gm ? gm.color.css : "#c0392b";
     }
@@ -249,6 +271,12 @@
       segments = [];
       currentSegment = null;
       selectedSession = "current"; // focus the new session
+      // Same reset a manual tab switch already does (see renderTabs()) - a
+      // fresh session's segments get fresh ids so there's no collision risk
+      // either way, but this bounds liveGroupsSeeded's growth to one
+      // session's worth of turns instead of the whole page's lifetime.
+      expandedGroups = new Set();
+      liveGroupsSeeded = new Set();
     }
 
     function getSelectedSessionData() {
@@ -296,6 +324,30 @@
       openSegment(paused ? "pause" : "unpause", active, game.combat);
     });
 
+    // Some modules hide an NPC's real name until a reveal condition is met
+    // (an "unidentified creature" system, say), then rename the combatant
+    // later. combatantName is captured once at segment creation and never
+    // re-read on its own (see Segment in AGENTS.md), so without this a
+    // reveal would leave every already-created segment showing the old,
+    // hidden name forever - checked once per render tick against the LIVE
+    // combat and propagated backward onto every segment for that combatant
+    // in the CURRENTLY TRACKED session (segments/currentSegment directly,
+    // not allSegments() - this must stay tied to the live data regardless of
+    // which tab is selected for viewing). An archived session's combat no
+    // longer exists live to compare against, so it can't be fixed there.
+    function syncCombatantNames() {
+      const combat = game.combat;
+      if (!combat) return;
+      const liveSegs = currentSegment ? [...segments, currentSegment] : segments;
+      for (const c of combat.combatants) {
+        const liveName = c.name ?? c.token?.name ?? null;
+        if (!liveName) continue;
+        for (const seg of liveSegs) {
+          if (seg.combatantId === c.id && seg.combatantName !== liveName) seg.combatantName = liveName;
+        }
+      }
+    }
+
     // ---- Derived stats (always for the SELECTED session) ----
     function allSegments() {
       const { segs, current } = getSelectedSessionData();
@@ -338,7 +390,7 @@
     // them apart, since a player-owned summon still has an NPC-shaped actor.
     // Not generalized to other systems (this script doesn't support any),
     // but kept as one place to extend if that ever changes, instead of the
-    // same literal string duplicated at every call site that cares (N-08).
+    // same literal string duplicated at every call site that cares.
     const PC_ACTOR_TYPE = "character";
     function isPcActorType(actorType) {
       return actorType === PC_ACTOR_TYPE;
@@ -365,7 +417,7 @@
     // Like resolvedOwner(), but a defeated NPC's instant-skip inherits
     // whoever owned its last real turn (possibly nobody, i.e. the GM/Monsters
     // bucket) instead of always reading as unclaimed - this is what stops
-    // that time from silently vanishing from every total (see S-01).
+    // that time from silently vanishing from every total.
     function effectiveOwner(seg, lastLiveOwner) {
       if (seg.overrideOwnerId) return seg.overrideOwnerId;
       if (seg.ownerId) return seg.ownerId;
@@ -384,7 +436,7 @@
       const getOwner = (id) => {
         if (!map.has(id)) {
           map.set(id, {
-            id, name: game.users.get(id)?.name ?? "?", color: getCombatantColor(id),
+            id, name: ownerName(id), color: getCombatantColor(id),
             totalMs: 0, turnCount: 0, inTurnMs: 0, outOfTurnMs: 0, pausedMs: 0, byEntity: new Map(),
           });
         }
@@ -447,17 +499,17 @@
       return { totalS: Math.round(totalMs / 1000), turns, avgS: turns ? Math.round(totalMs / turns / 1000) : 0 };
     }
 
-    // Deliberately does not gate on hasCombatContext() like the other
-    // aggregates - dm/team/setup time commonly has no combatantId at all
-    // (pre-combat prep, between-encounter housekeeping), and that's exactly
-    // the time these categories exist to capture, not an edge case to drop.
+    // Raw totals for the two categories nobody else already aggregates -
+    // "dm" is covered by gmTotalStats()/countsForGM() instead, so it isn't
+    // tracked here. Deliberately does not gate on hasCombatContext() like
+    // the other aggregates - team/setup time commonly has no combatantId at
+    // all (pre-combat prep, between-encounter housekeeping), and that's
+    // exactly the time these categories exist to capture, not an edge case
+    // to drop.
     function categoryTotals() {
-      const t = { dm: 0, team: 0, setup: 0 };
+      const t = { team: 0, setup: 0 };
       for (const seg of allSegments()) if (seg.category in t) t[seg.category] += segMs(seg);
-      return {
-        dmMs: t.dm, teamMs: t.team, setupMs: t.setup,
-        dmS: Math.round(t.dm / 1000), teamS: Math.round(t.team / 1000), setupS: Math.round(t.setup / 1000),
-      };
+      return { teamMs: t.team, setupMs: t.setup };
     }
 
     // Partitions the whole timeline into turn slots, independent of who ends
@@ -494,21 +546,27 @@
       return slots;
     }
 
-    function betweenTurnStats() {
+    // Shared by betweenTurnStats() and turnWindowStats(): each player's own
+    // real turn-opening slots, grouped by owner, plus the whole session's
+    // span. A slot's designatedOwner comes straight from the opening
+    // segment's raw ownerId regardless of category - a stray "setup" blip
+    // (e.g. a tracker mis-click) still carries a real player's id and would
+    // otherwise be mistaken for one of "their" turn boundaries.
+    function ownTurnSlotsByOwner() {
       const slots = buildTurnSlots();
       const byOwner = new Map();
       for (const s of slots) {
-        // A slot's designatedOwner comes straight from the opening segment's
-        // ownerId regardless of category - a stray "setup" blip (e.g. a
-        // tracker mis-click) still carries a real player's id and would
-        // otherwise slice one genuine gap into two much smaller fake ones.
         if (!s.designatedOwner || s.segments[0].category !== "player" || !isRealTurn(s.segments[0]) || !isTurnStart(s.segments[0])) continue;
         if (!byOwner.has(s.designatedOwner)) byOwner.set(s.designatedOwner, []);
         byOwner.get(s.designatedOwner).push(s);
       }
       const spanStart = slots.length ? Math.min(...slots.map((s) => s.start)) : 0;
       const spanEnd = slots.length ? Math.max(...slots.map((s) => s.end)) : 0;
+      return { byOwner, spanStart, spanEnd };
+    }
 
+    function betweenTurnStats() {
+      const { byOwner, spanStart, spanEnd } = ownTurnSlotsByOwner();
       const result = new Map();
       for (const [id, list] of byOwner) {
         list.sort((a, b) => a.start - b.start);
@@ -520,6 +578,50 @@
         const wrap = (list[0].start - spanStart) + (spanEnd - list[list.length - 1].end);
         if (wrap > 0) { sum += wrap; count += 1; }
         result.set(id, { avgMs: count ? sum / count : 0, count });
+      }
+      return result;
+    }
+
+    // Fences each player's own timeline into one window per turn, the same
+    // way a "round" was defined for them from the start: a turn's window
+    // runs from the end of their PREVIOUS turn (or the session start, for
+    // their first) through the end of THIS turn - so anything credited to
+    // them out-of-turn in between (e.g. an Attack of Opportunity) belongs to
+    // the turn whose window it fell in, not floating outside every turn.
+    // The last turn has no "next" turn to hand off to, so its window keeps
+    // absorbing time through the end of the session instead of stopping at
+    // its own turn's end - trailing activity still counts toward the turn
+    // that precedes it. Because these windows partition the player's
+    // entire credited timeline with no gaps or overlaps, the sum across all
+    // of them is always exactly perCombatantStats()'s totalMs for that
+    // player - so the average this returns can never disagree with the
+    // total shown next to it, unlike a plain inTurnMs/turnCount average.
+    function turnWindowStats() {
+      const { byOwner, spanStart, spanEnd } = ownTurnSlotsByOwner();
+      const lastLiveOwner = lastLiveOwnerByCombatant();
+      const segs = allSegments();
+
+      const result = new Map();
+      for (const [owner, list] of byOwner) {
+        list.sort((a, b) => a.start - b.start);
+        const windows = list.map((slot, i) => ({
+          turnIndex: i + 1,
+          start: i === 0 ? spanStart : list[i - 1].end,
+          end: i === list.length - 1 ? spanEnd : slot.end,
+          ms: 0,
+        }));
+        for (const seg of segs) {
+          if (seg.category !== "player" || !hasCombatContext(seg)) continue;
+          if (effectiveOwner(seg, lastLiveOwner) !== owner) continue;
+          // Half-open [start, end) windows chained end-to-end - every
+          // credited segment's start falls in exactly one, except a
+          // zero-duration edge case at the very last boundary, which the
+          // fallback folds into the last window rather than dropping.
+          const w = windows.find((win) => seg.start >= win.start && seg.start < win.end) ?? windows[windows.length - 1];
+          w.ms += segMs(seg);
+        }
+        const totalMs = windows.reduce((sum, w) => sum + w.ms, 0);
+        result.set(owner, { windows, avgMs: windows.length ? totalMs / windows.length : 0 });
       }
       return result;
     }
@@ -593,25 +695,19 @@
     const randomTurnDurationMs = () => randomGaussianDurationMs(30_000, 210_000);
     const randomPauseDurationMs = () => randomGaussianDurationMs(30_000, 60_000);
 
-    // Real players if the world actually has a GM plus at least 3 players
-    // configured - otherwise nobody to draw from. When real data is used,
-    // ALL non-GM users are included (not capped at 3). Colors are always
-    // resolved fresh from ownerId at render time (getCombatantColor()),
-    // never stored here.
+    // Always uses every real (non-GM) user the world actually has - not
+    // capped at 3 - so the preview reflects the actual campaign roster.
+    // Padded up to 3 total with synthetic placeholder players when there
+    // aren't enough real ones: `dummy-owner-<Name>` never collides with a
+    // real Foundry user id, and ownerName()/getCombatantColor() both
+    // know how to resolve it (name straight out of the id, color via a
+    // stable hash) - so a 1-player world still gets 2 distinct placeholder
+    // people instead of a bare grey "?", but never fakes over a real player.
     function getDummyPlayerSource() {
-      const realPlayers = game.users.filter((u) => !u.isGM);
-      const gmExists = game.users.some((u) => u.isGM);
-      if (gmExists && realPlayers.length >= 3) {
-        return realPlayers.map((u) => ({ name: u.name, ownerId: u.id }));
-      }
-      // Not enough real players to draw 3 distinct ones - keep the fixed
-      // placeholder character names, but cycle ownerId through whichever
-      // real users actually exist (players first, then anyone at all)
-      // instead of an invented id no game.users entry matches - otherwise
-      // ownerName()/getCombatantColor() can't resolve it and every owner
-      // display falls back to "?" and grey (N-01).
-      const pool = realPlayers.length ? realPlayers : game.users.filter(() => true);
-      return ["Aria", "Boro", "Cass"].map((name, i) => ({ name, ownerId: pool[i % pool.length]?.id ?? null }));
+      const realPlayers = game.users.filter((u) => !u.isGM).map((u) => ({ name: u.name, ownerId: u.id }));
+      const needed = Math.max(0, 3 - realPlayers.length);
+      const synthetic = ["Aria", "Boro", "Cass"].slice(0, needed).map((name) => ({ name, ownerId: `dummy-owner-${name}` }));
+      return [...realPlayers, ...synthetic];
     }
 
     function generateDummySegments() {
@@ -675,32 +771,59 @@
       toast("Dummy data loaded.");
     }
 
+    // Shared by gmTotalStats() and gmRoundStats(): does this segment's time
+    // belong to the GM at all - either an unclaimed monster's own turn (the
+    // indirect path) or anything explicitly recategorized to "dm" (the
+    // direct path, e.g. a player's turn or a pause that was really the GM's
+    // time). A DM-direct segment has no combatant by nature - hasCombatContext()
+    // only gates the indirect (unclaimed-monster) path.
+    function countsForGM(seg, lastLiveOwner) {
+      const unclaimedNpcTurn = hasCombatContext(seg) && seg.category === "player" && effectiveOwner(seg, lastLiveOwner) === null;
+      return unclaimedNpcTurn || seg.category === "dm";
+    }
+
     // Combined GM total: monster-turn time (not reassigned away) PLUS any
-    // segment explicitly recategorized as "dm" (e.g. a player's turn or a
-    // pause that was really the GM's time, not the player's).
+    // segment explicitly recategorized as "dm". byEntity lets buildBarsContent()
+    // render the GM bar as a stack of per-monster segments, same as a player's
+    // controlled entities. See gmRoundStats() for the GM's per-round average -
+    // unlike a player, the GM has no single "own turn" to fence an average by.
     function gmTotalStats() {
-      let ms = 0, turns = 0;
-      const byEntity = new Map();
       const lastLiveOwner = lastLiveOwnerByCombatant();
+      const byEntity = new Map();
+      let ms = 0;
       for (const seg of allSegments()) {
-        // A DM-direct segment ("dm" category) has no combatant by nature -
-        // hasCombatContext() only gates the indirect (unclaimed-monster) path.
-        const unclaimedNpcTurn = hasCombatContext(seg) && seg.category === "player" && effectiveOwner(seg, lastLiveOwner) === null;
-        const countsForGM = unclaimedNpcTurn || seg.category === "dm";
-        if (!countsForGM) continue;
+        if (!countsForGM(seg, lastLiveOwner)) continue;
         const segDurMs = segMs(seg);
         ms += segDurMs;
         if (!byEntity.has(seg.combatantId)) {
-          byEntity.set(seg.combatantId, { combatantId: seg.combatantId, name: seg.combatantName, ms: 0, turnCount: 0 });
+          byEntity.set(seg.combatantId, { combatantId: seg.combatantId, name: seg.combatantName, ms: 0 });
         }
-        const entity = byEntity.get(seg.combatantId);
-        entity.ms += segDurMs;
-        // isRealTurn() alone answers "does this count as real activity", not
-        // "does this open a turn" - without isTurnStart() too, a monster
-        // turn's own pause/unpause/split segments would each count again.
-        if (isRealTurn(seg) && isTurnStart(seg)) { turns += 1; entity.turnCount += 1; }
+        byEntity.get(seg.combatantId).ms += segDurMs;
       }
-      return { totalMs: ms, turnCount: turns, byEntity: [...byEntity.values()] };
+      return { totalMs: ms, byEntity: [...byEntity.values()] };
+    }
+
+    // The GM's average "per turn" is defined per ROUND, not per individual
+    // monster turn - round 1 is "combat start through the end of round 1",
+    // round 2 is "end of round 1 through end of round 2", and so on. Unlike
+    // a player's turnWindowStats() (which has to compute window boundaries
+    // from turn-slot end times, since a player's own turns are scattered
+    // through the timeline), every segment already carries the round it was
+    // created in (see Segment in AGENTS.md) - rounds are already a
+    // contiguous, gapless partition of the whole session, so grouping by
+    // that field directly IS the fencing. A round with no GM-attributed time
+    // still counts in the denominator (a quiet round still happened), which
+    // is why this can't just reuse gmTotalStats()'s totalMs - it also needs
+    // to know how many rounds occurred at all, not only which had GM time.
+    function gmRoundStats() {
+      const lastLiveOwner = lastLiveOwnerByCombatant();
+      const rounds = new Set();
+      let ms = 0;
+      for (const seg of allSegments()) {
+        if (seg.round != null) rounds.add(seg.round);
+        if (countsForGM(seg, lastLiveOwner)) ms += segMs(seg);
+      }
+      return { roundCount: rounds.size, avgMs: rounds.size ? ms / rounds.size : 0 };
     }
 
     // All players worth offering in the reassignment picker: currently in
@@ -911,13 +1034,33 @@
       const entries = summaryEntries();
       const max = Math.max(1, ...entries.map((e) => e.totalMs));
       const sessionMs = sessionTotalMs();
+      // Player averages come from turnWindowStats() - it fences each
+      // player's own out-of-turn credit into the turn-cycle it fell in, so
+      // the average always multiplies back out to exactly their total. The
+      // GM's average is per ROUND instead (gmRoundStats()) - the GM has no
+      // single "own turn" the way a player does, so "combat start through
+      // end of round 1", "end of round 1 through end of round 2", etc. is
+      // the unit that makes sense there. Both are exact partitions of the
+      // relevant total, so neither ever needs an "in-turn only" caveat.
+      const turnWindows = turnWindowStats();
+      const gmRounds = gmRoundStats();
       let anyIndicator = false;
 
       const bars = entries.map((e) => {
         const s = Math.round(e.totalMs / 1000);
         const pct = Math.max(4, Math.round((e.totalMs / max) * 100));
         const ofTotal = sessionMs > 0 ? ` · ${Math.round((e.totalMs / sessionMs) * 100)}%` : "";
-        const avg = e.turnCount > 0 ? ` · Ø ${formatDuration(Math.round(e.inTurnMs / e.turnCount / 1000))}/turn` : "";
+        const tw = e.kind === "player" ? turnWindows.get(e.id) : null;
+        let avg = "";
+        if (tw && tw.windows.length) {
+          // turnWindowStats() fences on this player's own consecutive turns,
+          // which in ordinary play (one turn per combatant per round) lines
+          // up with the actual combat round - "/round" here, matching the
+          // GM's label, without changing what's being computed.
+          avg = ` · Ø ${formatDuration(Math.round(tw.avgMs / 1000))}/round`;
+        } else if (e.kind === "gm" && gmRounds.roundCount > 0) {
+          avg = ` · Ø ${formatDuration(Math.round(gmRounds.avgMs / 1000))}/round`;
+        }
 
         let fillInner, indicatorRow = "";
         if (e.kind === "player") {
@@ -966,10 +1109,12 @@
     function buildPlayerListContent() {
       const gaps = betweenTurnStats();
       const waits = absoluteWaitStats();
+      const turnWindows = turnWindowStats();
       const rows = perCombatantStats()
         .sort((a, b) => b.totalMs - a.totalMs)
         .map((e) => {
-          const avgTurn = e.turnCount ? Math.round(e.inTurnMs / e.turnCount / 1000) : 0;
+          const tw = turnWindows.get(e.id);
+          const avgTurn = tw && tw.windows.length ? Math.round(tw.avgMs / 1000) : 0;
           const turnCountTag = e.turnCount ? ` (${e.turnCount}×)` : "";
           const g = gaps.get(e.id);
           const avgGap = g && g.count ? `Ø ${formatDuration(Math.round(g.avgMs / 1000))}` : "–";
@@ -1077,11 +1222,11 @@
             ? { session: "current", segments: [...segments], currentSegment }
             : { session: selectedSession, entry: sessionHistory[selectedSession === "prev1" ? 0 : 1] ?? null };
 
-          // Routed through makeSegment() so a segment from an older script
-          // version (missing a field added since) gets that field's current
-          // default instead of carrying `undefined` forever.
-          const importedSegments = parsed.segments.map((s) => makeSegment(s));
-          const importedCurrent = parsed.currentSegment ? makeSegment(parsed.currentSegment) : null;
+          // Imported data is assumed to already be in the current segment
+          // shape (this script only supports data it wrote itself) - no
+          // backfilling for fields from an older script version.
+          const importedSegments = parsed.segments;
+          const importedCurrent = parsed.currentSegment ?? null;
 
           if (selectedSession === "current") {
             segments = importedSegments;
@@ -1159,7 +1304,7 @@
 
     let segFilter = "all";              // "all" | "setup" | "reassigned" | "long"
     let expandedGroups = new Set();     // turn-slot keys (opening segment id) currently expanded
-    let liveGroupsSeeded = new Set();   // live-group keys already given their one-time default-expanded seed (U-03)
+    let liveGroupsSeeded = new Set();   // live-group keys already given their one-time default-expanded seed
     let openCatSegId = null;            // which segment has its category picker open
     let menuOpen = false;               // the ⋯ overflow menu
     let postMenuOpen = false;           // the "Post report" dropdown
@@ -1197,8 +1342,18 @@
     function labelColorOn(hex) {
       return relLuminance(hex) > 0.3 ? "rgba(0,0,0,0.62)" : "rgba(255,255,255,0.85)";
     }
+    // Same "unresolvable id" problem as getCombatantColor(): a
+    // dummy-data id carries its own name right in the id (see
+    // getDummyPlayerSource()) and is resolved back out of it here; anything
+    // else unresolvable (an imported session's owner who isn't in this
+    // world's roster) gets a short, stable placeholder instead of a bare "?".
     function ownerName(id) {
-      return id ? (game.users.get(id)?.name ?? "?") : null;
+      if (!id) return null;
+      const real = game.users.get(id)?.name;
+      if (real) return real;
+      const dummy = /^dummy-owner-(.+)$/.exec(id);
+      if (dummy) return dummy[1];
+      return `Player ${id.slice(0, 4)}`;
     }
     function pct(part, whole) {
       return whole > 0 ? Math.round((part / whole) * 100) : 0;
@@ -1216,10 +1371,6 @@
       if (document.body.contains(panel)) panel.remove();
       panelVisible = false;
       buildReopenButton();
-    }
-    function togglePanel() {
-      if (panelVisible && document.body.contains(panel)) closePanel();
-      else openPanel();
     }
 
     // Keeps the panel inside the viewport. Called on load (the window may have
@@ -1240,7 +1391,7 @@
     // (everything else in the panel) rather than the flat SEG_HEIGHT_MAX
     // constant, so the panel's total height can never exceed the viewport -
     // otherwise #ctp-toast, the last element in the panel, renders past
-    // window.innerHeight and becomes unreachable (U-01).
+    // window.innerHeight and becomes unreachable.
     function maxSegHeight() {
       const segEl = panel?.querySelector("#ctp-segments");
       if (!panel || !segEl) return SEG_HEIGHT_MAX;
@@ -1266,7 +1417,7 @@
     // Re-clamps position and segment-list height against the current
     // viewport - called on load and on window resize, so a panel sized/moved
     // on a larger screen (or before the browser window shrank) can't leave
-    // the confirm/undo bar unreachable (U-01).
+    // the confirm/undo bar unreachable.
     function reclampForViewport() {
       if (!panel || !document.body.contains(panel)) return;
       applyPanelPosition();
@@ -1668,13 +1819,16 @@
       const gm = gmTotalStats();
       const cat = categoryTotals();
       if (gm.totalMs > 0) {
-        entries.push({ id: "gm-total", name: "GM", icon: "🎲", color: getCombatantColor(null), totalMs: gm.totalMs, turnCount: gm.turnCount, byEntity: gm.byEntity, kind: "gm" });
+        // No turnCount/inTurnMs here - buildBarsContent() gets the GM's
+        // per-round average from gmRoundStats() instead, since the GM has
+        // no single "own turn" the way a player does.
+        entries.push({ id: "gm-total", name: "GM", icon: "🎲", color: getCombatantColor(null), totalMs: gm.totalMs, byEntity: gm.byEntity, kind: "gm" });
       }
       if (cat.teamMs > 0) {
-        entries.push({ id: "team-total", name: "Team", icon: "👥", color: TEAM_COLOR, totalMs: cat.teamMs, turnCount: 0, kind: "flat" });
+        entries.push({ id: "team-total", name: "Team", icon: "👥", color: TEAM_COLOR, totalMs: cat.teamMs, kind: "flat" });
       }
       if (cat.setupMs > 0) {
-        entries.push({ id: "setup-total", name: "Setup", icon: "🛠️", color: SETUP_COLOR, totalMs: cat.setupMs, turnCount: 0, kind: "flat" });
+        entries.push({ id: "setup-total", name: "Setup", icon: "🛠️", color: SETUP_COLOR, totalMs: cat.setupMs, kind: "flat" });
       }
       entries.sort((a, b) => b.totalMs - a.totalMs);
       return entries;
@@ -1692,9 +1846,9 @@
         return;
       }
       // Shared denominator with the chat report's bars (sessionTotalMs(), not
-      // the sum of entries) - S-01's leftover time (a segment with no active
+      // the sum of entries) - leftover time (a segment with no active
       // combatant, e.g. pre-combat setup) isn't in any entry, so without this
-      // it silently vanished from the strip instead of showing as "Other".
+      // it would silently vanish from the strip instead of showing as "Other".
       const entriesMs = entries.reduce((sum, e) => sum + e.totalMs, 0);
       const sessionMs = sessionTotalMs();
       const total = Math.max(sessionMs, entriesMs) || 1;
@@ -1814,7 +1968,11 @@
       for (const g of groups) {
         parts.push(`G${g.key}:${g.segments.length}`);
         for (const s of g.segments) {
-          parts.push(`${s.id}:${s.category}:${s.overrideOwnerId ?? ""}:${s.defeated ? 1 : 0}:${s.end === null ? "live" : s.end}`);
+          // combatantName included - syncCombatantNames() mutates it in
+          // place on already-created segments when a module reveals a
+          // hidden NPC name mid-combat, and without it in the signature the
+          // list wouldn't reflect that until some other field changed too.
+          parts.push(`${s.id}:${s.category}:${s.overrideOwnerId ?? ""}:${s.defeated ? 1 : 0}:${s.combatantName}:${s.end === null ? "live" : s.end}`);
         }
       }
       return parts.join("|");
@@ -1929,11 +2087,31 @@
       // visibleSegments narrows which children render under the active
       // filter; the count/total above always reflect the group's real,
       // unfiltered contents so a filtered subtotal never masquerades as the
-      // whole (U-04) - the "X of Y" makes the gap explicit instead.
+      // whole - the "X of Y" makes the gap explicit instead.
       const visible = g.visibleSegments ?? g.segments;
       const partsLabel = visible.length === g.segments.length
         ? `${g.segments.length} parts`
         : `${visible.length} of ${g.segments.length} parts`;
+      // A collapsed group attributes its whole total to the opener's name and
+      // color even when some of its parts were recategorized or reassigned
+      // elsewhere - the children show the truth when expanded, but a small
+      // composition chip (reusing proportionalSegmentsHtml(), same as
+      // the chat report bars) signals the split at a glance instead. Colored
+      // the same way a segment's own dot/chip would be: a "player" segment
+      // by its (possibly reassigned) owner's color, everything else by its
+      // category color - so the chip lines up with what expanding reveals.
+      // "ignore" segments are left out, matching groupTotalMs()'s exclusion.
+      const chipColor = (seg) => seg.category === "player"
+        ? getCombatantColor(resolvedOwner(seg))
+        : (CATEGORY_META[seg.category]?.bg ?? CATEGORY_META.player.bg);
+      const countable = g.segments.filter((s) => s.category !== "ignore");
+      const mixed = new Set(countable.map(chipColor)).size > 1;
+      const compositionChip = mixed
+        ? `<span title="Mixes more than one category/owner - expand to see the split"
+                 style="flex-shrink:0; width:30px; height:7px; border-radius:3px; overflow:hidden; display:flex;">
+             ${proportionalSegmentsHtml(countable.map((s) => ({ ms: segMs(s), color: chipColor(s) })), Infinity)}
+           </span>`
+        : "";
       const header = `
         <div data-group-row data-group="${g.key}" data-anchor-group="${g.key}" style="display:flex; align-items:center; gap:6px;
              padding:6px 10px; font-size:11px; cursor:pointer;">
@@ -1944,6 +2122,7 @@
             <span style="opacity:0.4;"> · ${partsLabel}</span>
             ${live ? " ●" : ""}
           </span>
+          ${compositionChip}
           <span ${live ? `data-group-dur="${g.key}"` : ""} style="font-variant-numeric:tabular-nums; flex-shrink:0;">${total}</span>${ignoredTag}
         </div>`;
 
@@ -1962,7 +2141,7 @@
       let groups = buildDisplayGroups();
       // Liveness only seeds the *initial* expanded state, once per group key -
       // after that it's tracked in expandedGroups like every other group, so
-      // the chevron can actually collapse a still-running group (U-03).
+      // the chevron can actually collapse a still-running group.
       for (const g of groups) {
         if (groupIsLive(g) && !liveGroupsSeeded.has(g.key)) {
           expandedGroups.add(g.key);
@@ -1974,7 +2153,7 @@
         // Keep g.segments as the group's real, full list (groupTotalMs() etc.
         // all read it) - only visibleSegments narrows for display, so a
         // filtered group's header can still show its true total instead of a
-        // filtered subtotal masquerading as the whole (U-04).
+        // filtered subtotal masquerading as the whole.
         groups = groups
           .map((g) => ({ ...g, visibleSegments: g.segments.filter(segmentMatchesFilter) }))
           .filter((g) => g.visibleSegments.length);
@@ -2023,21 +2202,32 @@
       // Anchor on the topmost visible row's own element instead of a raw
       // scrollTop pixel offset - the list is newest-first (new content
       // inserts at the top), so a bare offset points at different content
-      // after every new segment (only invisible at scrollTop === 0) (U-05).
+      // after every new segment (only invisible at scrollTop === 0).
       const hostRectBefore = host.getBoundingClientRect();
       let anchor = null;
       for (const node of host.querySelectorAll("[data-anchor-group], [data-anchor-seg]")) {
         const rect = node.getBoundingClientRect();
         if (rect.bottom > hostRectBefore.top) {
           const attr = node.hasAttribute("data-anchor-seg") ? "data-anchor-seg" : "data-anchor-group";
-          anchor = { selector: `[${attr}="${CSS.escape(node.getAttribute(attr))}"]`, offset: rect.top - hostRectBefore.top };
+          const id = node.getAttribute(attr);
+          // If this anchor is a child segment, also remember its enclosing
+          // group's own key (which survives the group being collapsed, since
+          // the header keeps data-anchor-group) as a fallback - so collapsing
+          // a group scrolled halfway down the list re-anchors on its
+          // now-collapsed header instead of snapping to the top.
+          const fallbackKey = attr === "data-anchor-seg" ? groups.find((g) => g.segments.some((s) => s.id === id))?.key ?? null : null;
+          anchor = {
+            selector: `[${attr}="${CSS.escape(id)}"]`,
+            fallbackSelector: fallbackKey ? `[data-anchor-group="${CSS.escape(fallbackKey)}"]` : null,
+            offset: rect.top - hostRectBefore.top,
+          };
           break;
         }
       }
 
       host.innerHTML = html;
 
-      const newAnchorEl = anchor && host.querySelector(anchor.selector);
+      const newAnchorEl = anchor && (host.querySelector(anchor.selector) ?? (anchor.fallbackSelector && host.querySelector(anchor.fallbackSelector)));
       if (newAnchorEl) {
         const hostRectAfter = host.getBoundingClientRect();
         const newOffset = newAnchorEl.getBoundingClientRect().top - hostRectAfter.top;
@@ -2128,6 +2318,7 @@
     }
 
     function renderPanel() {
+      syncCombatantNames();
       persist();
       if (!panelVisible || !document.body.contains(panel)) return;
       renderMenu();
