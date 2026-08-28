@@ -44,7 +44,7 @@
     // (🧑 meant both "player-controlled" and "category: player").
     const CATEGORY_META = {
       player: { icon: "🧑", label: "Player", bg: "#2f4f7a", fg: "#cfe3ff" },
-      dm:     { icon: "🎲", label: "GM",     bg: "#6b2f2f", fg: "#ffd2d2" },
+      gm:     { icon: "🎲", label: "GM",     bg: "#6b2f2f", fg: "#ffd2d2" },
       team:   { icon: "👥", label: "Team",   bg: "#2f5f57", fg: "#c9f0e6" },
       setup:  { icon: "🛠️", label: "Setup",  bg: "#6b5220", fg: "#ffe0ad" },
       ignore: { icon: "🚫", label: "Ignore", bg: "#3a3a46", fg: "#b8b8c4" }, // manual-only (never auto-assigned) - excluded from every total, for a segment that's really just a wall-clock gap (e.g. the session resumed days later)
@@ -53,7 +53,7 @@
     // Team and Setup are categories, not people. Setup used to reuse the GM's
     // color (getCombatantColor(null)), which made two adjacent bars in the same
     // chat report identical and unidentifiable. Team stays genuinely
-    // person-independent (shared/group time); Setup is DM-only by definition
+    // person-independent (shared/group time); Setup is GM-only by definition
     // (see defaultCategory()/categoryPickerHTML()) but keeps its own row and
     // color rather than folding into the GM bar, for that same legibility reason.
     const TEAM_COLOR = "#383E42";
@@ -135,21 +135,27 @@
     const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one
     const SHORT_PAUSE_MERGE_THRESHOLD_MS = 3000; // a pause shorter than this is noise (toggle lag, a misclick) - fold it into whatever ran right before instead of showing it as its own segment
 
-    // Setup is a DM-only category (see CATEGORY_META) - a segment with a
+    // Setup is a GM-only category (see CATEGORY_META) - a segment with a
     // player owner can never default to, or inherit, "setup".
     function defaultCategory(trigger, prevSegment, ownerId) {
       if (trigger === "pause") {
-        const dmOwned = !ownerId;
+        const gmOwned = !ownerId;
         const prevDur = prevSegment ? segMs(prevSegment) : Infinity;
-        if (dmOwned && prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
+        if (gmOwned && prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
         // "ignore" is manual-only (see CATEGORY_META) - a live pause is real
         // time and must never silently inherit it from the segment before.
-        if (prevSegment && prevSegment.category !== "ignore" && (dmOwned || prevSegment.category !== "setup")) {
+        if (prevSegment && prevSegment.category !== "ignore" && (gmOwned || prevSegment.category !== "setup")) {
           return prevSegment.category;
         }
-        return dmOwned ? "setup" : "player";
+        return gmOwned ? "setup" : "player";
       }
-      return "player";
+      // A genuinely unowned combatant's own turn is the GM's by default -
+      // not "player" - so the category chip reads correctly the moment a
+      // monster's turn starts, instead of only becoming true GM time
+      // indirectly through the stats functions (see effectiveOwner()/
+      // countsForGM() for how a manual "gm" recategorization, or a defeated
+      // combatant's redirect, still resolve correctly on top of this).
+      return ownerId ? "player" : "gm";
     }
 
     function closeSegment() {
@@ -414,13 +420,24 @@
       }
       return map;
     }
-    // Like resolvedOwner(), but a defeated NPC's instant-skip inherits
-    // whoever owned its last real turn (possibly nobody, i.e. the GM/Monsters
-    // bucket) instead of always reading as unclaimed - this is what stops
-    // that time from silently vanishing from every total.
+    // Like resolvedOwner(), but with two differences. First, a defeated
+    // NPC's instant-skip inherits whoever owned its last real turn (possibly
+    // nobody, i.e. the GM/Monsters bucket) instead of always reading as
+    // unclaimed - this is what stops that time from silently vanishing from
+    // every total. Second, a manual "gm" recategorization always wins over
+    // the segment's own technical ownerId - that's the entire point of
+    // flagging a player's own turn as "this was really the GM's time, not
+    // theirs" (defaultCategory() only ever hands out "gm" on its own to an
+    // already-unowned combatant, so ownerId is only non-null here when a
+    // human explicitly overrode a segment that technically belonged to
+    // someone) - without this, ignoring the override would just resolve
+    // straight back to that same player via ownerId, undoing the whole
+    // recategorization. A genuinely unowned "gm" segment (ownerId already
+    // null) falls through to the same defeated-redirect check as any other
+    // unclaimed segment, so that mechanism keeps working unchanged.
     function effectiveOwner(seg, lastLiveOwner) {
       if (seg.overrideOwnerId) return seg.overrideOwnerId;
-      if (seg.ownerId) return seg.ownerId;
+      if (seg.category !== "gm" && seg.ownerId) return seg.ownerId;
       if (seg.defeated) return lastLiveOwner.get(seg.combatantId) ?? null;
       return null;
     }
@@ -465,9 +482,14 @@
           getEntity(owner, opening).turnCount += 1;
         }
         for (const seg of slot.segments) {
-          if (seg.category !== "player" || !hasCombatContext(seg)) continue;
+          // "gm" included alongside "player" - a defeated, genuinely-unowned
+          // combatant's instant-skip can still be category "gm" (its own
+          // default) while effectiveOwner() redirects it to whoever last
+          // owned one of its real turns; excluding "gm" here would drop
+          // that credit instead of crediting the right player.
+          if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg)) continue;
           const owner = effectiveOwner(seg, lastLiveOwner);
-          if (!owner) continue; // unclaimed NPC turn -> npcAggregate/gmTotalStats instead
+          if (!owner) continue; // unclaimed -> npcAggregate/gmTotalStats instead
           const e = getOwner(owner);
           const entity = getEntity(e, seg);
           const ms = segMs(seg);
@@ -489,8 +511,13 @@
       let totalMs = 0, turns = 0;
       const lastLiveOwner = lastLiveOwnerByCombatant();
       for (const seg of allSegments()) {
-        if (seg.category !== "player" || !hasCombatContext(seg)) continue;
-        if (effectiveOwner(seg, lastLiveOwner) !== null) continue; // claimed by someone -> perCombatantStats/gmTotalStats("dm") instead
+        // ownerId (not resolvedOwner/effectiveOwner) - this isolates a
+        // genuinely unowned creature's own turn from a technically-owned
+        // segment a human manually flagged "gm" (that one belongs in
+        // gmTotalStats()'s combined total, but isn't "a monster's turn").
+        if (seg.ownerId != null || !hasCombatContext(seg)) continue;
+        if (seg.category !== "player" && seg.category !== "gm") continue;
+        if (effectiveOwner(seg, lastLiveOwner) !== null) continue; // claimed by someone -> perCombatantStats/gmTotalStats("gm") instead
         totalMs += segMs(seg);
         // isTurnStart() too - see gmTotalStats() - so a pause/unpause/split
         // inside one monster's turn doesn't count as several turns.
@@ -500,7 +527,7 @@
     }
 
     // Raw totals for the two categories nobody else already aggregates -
-    // "dm" is covered by gmTotalStats()/countsForGM() instead, so it isn't
+    // "gm" is covered by gmTotalStats()/countsForGM() instead, so it isn't
     // tracked here. Deliberately does not gate on hasCombatContext() like
     // the other aggregates - team/setup time commonly has no combatantId at
     // all (pre-combat prep, between-encounter housekeeping), and that's
@@ -611,7 +638,7 @@
           ms: 0,
         }));
         for (const seg of segs) {
-          if (seg.category !== "player" || !hasCombatContext(seg)) continue;
+          if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg)) continue;
           if (effectiveOwner(seg, lastLiveOwner) !== owner) continue;
           // Half-open [start, end) windows chained end-to-end - every
           // credited segment's start falls in exactly one, except a
@@ -648,7 +675,7 @@
       const lastLiveOwner = lastLiveOwnerByCombatant();
       const activeMs = new Map();
       for (const seg of allSegments()) {
-        if (seg.category !== "player" || !hasCombatContext(seg)) continue;
+        if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg)) continue;
         const owner = effectiveOwner(seg, lastLiveOwner);
         if (!owner) continue;
         activeMs.set(owner, (activeMs.get(owner) ?? 0) + segMs(seg));
@@ -737,6 +764,7 @@
             combatantId: `dummy-${entry.name}`, combatantName: entry.name,
             round: round + 1, turnIndex, // Foundry rounds are 1-indexed, turn index is 0-indexed
             ownerId: entry.ownerId ?? null, actorType,
+            category: isPC ? "player" : "gm", // matches defaultCategory() - an unowned combatant's own turn is the GM's by default
             defeated: !isPC && round === 2 && entry.name === "Goblin A",
           }));
           t += dur;
@@ -747,7 +775,7 @@
               combatantId: `dummy-${entry.name}`, combatantName: entry.name,
               round: round + 1, turnIndex,
               ownerId: entry.ownerId ?? null, actorType,
-              category: !entry.ownerId && Math.random() < 0.5 ? "setup" : "player",
+              category: entry.ownerId ? "player" : (Math.random() < 0.5 ? "setup" : "gm"),
             }));
             t += pauseDur;
           }
@@ -773,17 +801,22 @@
 
     // Shared by gmTotalStats() and gmRoundStats(): does this segment's time
     // belong to the GM at all - either an unclaimed monster's own turn (the
-    // indirect path) or anything explicitly recategorized to "dm" (the
+    // indirect path) or anything explicitly recategorized to "gm" (the
     // direct path, e.g. a player's turn or a pause that was really the GM's
-    // time). A DM-direct segment has no combatant by nature - hasCombatContext()
+    // time). A GM-direct segment has no combatant by nature - hasCombatContext()
     // only gates the indirect (unclaimed-monster) path.
     function countsForGM(seg, lastLiveOwner) {
-      const unclaimedNpcTurn = hasCombatContext(seg) && seg.category === "player" && effectiveOwner(seg, lastLiveOwner) === null;
-      return unclaimedNpcTurn || seg.category === "dm";
+      if (effectiveOwner(seg, lastLiveOwner) !== null) return false; // claimed (directly, or via a defeated-instant-skip redirect) -> perCombatantStats instead
+      if (seg.category === "gm") return true;
+      // The lingering "player"-category unclaimed case: a pause segment can
+      // still carry over "player" from whatever ran before it even while
+      // gmOwned (see defaultCategory()'s pause branch), and old/imported
+      // data may predate the "gm" default entirely.
+      return seg.category === "player" && hasCombatContext(seg);
     }
 
     // Combined GM total: monster-turn time (not reassigned away) PLUS any
-    // segment explicitly recategorized as "dm". byEntity lets buildBarsContent()
+    // segment explicitly recategorized as "gm". byEntity lets buildBarsContent()
     // render the GM bar as a stack of per-monster segments, same as a player's
     // controlled entities. See gmRoundStats() for the GM's per-round average -
     // unlike a player, the GM has no single "own turn" to fence an average by.
@@ -948,8 +981,35 @@
     // each entity's own column into paused / out-of-turn / in-turn. For an
     // ordinary single-entity player with no paused/out-of-turn time this
     // degenerates to exactly today's single solid bar with no indicator row.
+    // The main bar should only visually split entities this owner actually,
+    // structurally controls (their own PC, plus any of their own summons/pets
+    // that ever had a genuine designated turn) - not an alien combatant whose
+    // time only ever reached them via a redirect (e.g. Knut's Attack of
+    // Opportunity credited from the Gibbering Mouther's turn). An entity with
+    // no inTurnMs of its own never had a designated turn under this owner at
+    // all, so its ms folds into the primary entity here - the main bar stays
+    // one uniform color for it, and its out-of-turn/paused time still shows
+    // up in the indicator row below, merged into the primary's own column
+    // instead of getting a separate one. If NO entity has any inTurnMs (this
+    // owner only ever received redirected time), there's no genuine "owner
+    // entity" to fold into, so nothing is merged.
+    function mergeAlienEntities(byEntity, isPrimary) {
+      if (!byEntity.some((en) => en.inTurnMs > 0)) return byEntity;
+      const primaryIdx = byEntity.findIndex(isPrimary);
+      const primary = primaryIdx >= 0 ? byEntity[primaryIdx] : byEntity.find((en) => en.inTurnMs > 0);
+      const merged = { ...primary };
+      for (const en of byEntity) {
+        if (en === primary || en.inTurnMs > 0) continue;
+        merged.outOfTurnMs += en.outOfTurnMs;
+        merged.pausedMs += en.pausedMs;
+        merged.turnCount += en.turnCount;
+      }
+      return byEntity.filter((en) => en === primary || en.inTurnMs > 0).map((en) => en === primary ? merged : en);
+    }
+
     function buildPlayerBarRows(e) {
-      const entities = capEntities(e.byEntity, (en) => en.inTurnMs + en.outOfTurnMs, (en) => isPcActorType(en.actorType));
+      const owned = mergeAlienEntities(e.byEntity, (en) => isPcActorType(en.actorType));
+      const entities = capEntities(owned, (en) => en.inTurnMs + en.outOfTurnMs, (en) => isPcActorType(en.actorType));
       const ordered = orderAndShade(entities, (en) => isPcActorType(en.actorType))
         .map(({ item, shade }) => ({ item, color: darkenHex(e.color, shade) }));
       const showLabels = ordered.length > 1;
@@ -963,8 +1023,10 @@
         label: showLabels ? escapeHtml(item.name) : null,
         labelPct: 28,
         altLabel: showLabels ? formatDuration(Math.round((item.inTurnMs + item.outOfTurnMs) / 1000)) : null,
-        // The capped "+N more" slice otherwise names nobody it actually swallowed.
-        title: item.mergedNames ? item.mergedNames.join(", ") : null,
+        // Always a full-name tooltip, not just for the capped "+N more"
+        // slice - a narrow, label-less sliver still needs some way to say
+        // what it is.
+        title: item.mergedNames ? item.mergedNames.join(", ") : `${item.name} · ${formatDuration(Math.round((item.inTurnMs + item.outOfTurnMs) / 1000))}`,
       }));
       const mainSegs = proportionalSegmentsHtml(mainParts, 12);
 
@@ -1008,7 +1070,7 @@
         label: showLabels ? escapeHtml(item.name) : null,
         labelPct: 28,
         altLabel: showLabels ? formatDuration(Math.round(item.ms / 1000)) : null,
-        title: item.mergedNames ? item.mergedNames.join(", ") : null,
+        title: item.mergedNames ? item.mergedNames.join(", ") : `${item.name} · ${formatDuration(Math.round(item.ms / 1000))}`,
       }));
       return proportionalSegmentsHtml(parts, 12);
     }
@@ -1078,7 +1140,7 @@
         return `
           <div style="margin:6px 0;">
             <div style="display:flex; justify-content:space-between; gap:6px; font-size:11px; margin-bottom:2px; color:#eee !important;">
-              <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${e.icon} ${escapeHtml(e.name)}</span>
+              <span title="${escapeHtml(e.name)}" style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${e.icon} ${escapeHtml(e.name)}</span>
               <span style="flex-shrink:0; opacity:0.85; color:#eee !important;">${formatDuration(s)}${ofTotal}${avg}</span>
             </div>
             <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
@@ -1123,7 +1185,7 @@
             <div style="margin:8px 0;">
               <div style="display:flex; align-items:center; gap:6px; font-weight:600; color:#eee !important;">
                 <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:${e.color} !important; flex-shrink:0;"></span>
-                <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${escapeHtml(e.name)}</span>
+                <span title="${escapeHtml(e.name)}" style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#eee !important;">${escapeHtml(e.name)}</span>
               </div>
               <div style="display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; font-size:10px; opacity:0.8; margin-top:2px; padding-left:14px; color:#eee !important;">
                 <span style="color:#eee !important;">Turn: Ø ${formatDuration(avgTurn)}${turnCountTag}</span>
@@ -1281,7 +1343,7 @@
     function uiStorageKey() {
       return `ctp-ui-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
-    const UI_DEFAULTS = { left: null, top: 60, segHeight: 240, summaryOpen: false };
+    const UI_DEFAULTS = { left: null, top: 60, panelWidth: 300, segHeight: 240, summaryOpen: false };
     let ui = { ...UI_DEFAULTS };
     try {
       const savedUi = JSON.parse(localStorage.getItem(uiStorageKey()) ?? "null");
@@ -1297,7 +1359,9 @@
       }
     }
 
-    const PANEL_WIDTH = 300;
+    const PANEL_WIDTH_DEFAULT = 300;
+    const PANEL_WIDTH_MIN = 220;
+    const PANEL_WIDTH_MAX = 560;
     const MAX_BAR_ENTITIES = 4; // per-entity stack cap in the chat bar chart
     const SEG_HEIGHT_MIN = 120;
     const SEG_HEIGHT_MAX = 700;
@@ -1313,6 +1377,7 @@
     let toastTimer = null;
     let dragState = null;
     let resizeState = null;
+    let resizeWState = null;
     // Declared here rather than at the `buildPanel()` call site: buildPanel()
     // assigns to it while running (applyPanelPosition() has to measure the real
     // element), which would hit the temporal dead zone if the binding were
@@ -1377,7 +1442,7 @@
     // been resized, or the panel dragged on a much wider screen last session)
     // and on every drag move, so it can never end up somewhere unreachable.
     function clampPanelPosition(left, top) {
-      const w = panel?.offsetWidth || PANEL_WIDTH;
+      const w = panel?.offsetWidth || PANEL_WIDTH_DEFAULT;
       const h = panel?.offsetHeight || 200;
       const maxLeft = Math.max(0, window.innerWidth - w);
       const maxTop = Math.max(0, window.innerHeight - Math.min(h, 120)); // keep at least the header reachable
@@ -1491,13 +1556,16 @@
       el.id = "combat-timer-panel";
       el.style.cssText = `
         position: fixed; top: 60px; right: 16px; z-index: 9999;
-        width: ${PANEL_WIDTH}px; font-family: "Signika", sans-serif; font-size: 12px;
+        width: ${ui.panelWidth}px; font-family: "Signika", sans-serif; font-size: 12px;
         background: #17171d;
         border: 1px solid #3a3a46; border-radius: 10px;
         box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: #ddd; overflow: hidden;
       `;
 
       el.innerHTML = `
+        <div id="ctp-resize-w" title="Drag to resize the panel width"
+             style="position:absolute; left:0; top:0; bottom:0; width:6px; cursor:ew-resize; z-index:3;"></div>
+
         <div id="ctp-header" style="cursor:move; padding:7px 10px; background:#2a2a35;
              display:flex; justify-content:space-between; align-items:center; user-select:none;">
           <span style="font-weight:600; letter-spacing:0.3px;">⚔️ Combat Times</span>
@@ -1618,6 +1686,40 @@
       resizer.addEventListener("pointerup", endResize);
       resizer.addEventListener("pointercancel", endResize);
 
+      // Width resize: dragged from the left edge, keeping the panel's
+      // current RIGHT edge fixed on screen regardless of anchor mode - when
+      // right-anchored (ui.left === null) that's already what CSS `right`
+      // does on its own from a plain width change; when explicitly
+      // left-positioned, `left` has to move too or the handle wouldn't
+      // track the cursor at all (the left edge would just sit still while
+      // only the right edge crept outward).
+      const resizerW = el.querySelector("#ctp-resize-w");
+      resizerW.addEventListener("pointerdown", (ev) => {
+        resizeWState = { rightEdge: el.getBoundingClientRect().right };
+        resizerW.setPointerCapture(ev.pointerId);
+        document.body.style.userSelect = "none";
+      });
+      resizerW.addEventListener("pointermove", (ev) => {
+        if (!resizeWState) return;
+        const maxW = Math.min(PANEL_WIDTH_MAX, window.innerWidth - 20);
+        const next = resizeWState.rightEdge - ev.clientX;
+        ui.panelWidth = Math.min(maxW, Math.max(PANEL_WIDTH_MIN, Math.round(next)));
+        el.style.width = `${ui.panelWidth}px`;
+        if (ui.left !== null && ui.left !== undefined) {
+          el.style.left = `${resizeWState.rightEdge - ui.panelWidth}px`;
+        }
+      });
+      const endResizeW = () => {
+        if (!resizeWState) return;
+        resizeWState = null;
+        document.body.style.userSelect = "";
+        if (ui.left !== null && ui.left !== undefined) ui.left = parseInt(el.style.left, 10);
+        persistUi();
+        reclampForViewport();
+      };
+      resizerW.addEventListener("pointerup", endResizeW);
+      resizerW.addEventListener("pointercancel", endResizeW);
+
       el.querySelector("#ctp-segments").style.height = `${ui.segHeight}px`;
       reclampForViewport();
       return el;
@@ -1642,6 +1744,9 @@
         }
         #combat-timer-panel #ctp-resize:hover span {
           background: #6a6a7c;
+        }
+        #combat-timer-panel #ctp-resize-w:hover {
+          background: rgba(255,255,255,0.1);
         }
         #combat-timer-panel #ctp-post:hover,
         #ctp-reopen:hover {
@@ -1785,7 +1890,7 @@
         body = `
           <div style="display:flex; align-items:center; gap:8px; margin-top:6px;">
             <span style="width:9px; height:9px; border-radius:50%; background:${color}; flex-shrink:0;"></span>
-            <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;">
+            <span title="${escapeHtml(currentSegment.combatantName)}${who ? ` (${escapeHtml(who)})` : ""}" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;">
               ${escapeHtml(currentSegment.combatantName)}${who ? ` <span style="opacity:0.55; font-weight:400;">${escapeHtml(who)}</span>` : ""}
             </span>
             <span id="ctp-live-dur" style="font-variant-numeric:tabular-nums;">${formatDuration(Math.round(segMs(currentSegment) / 1000))}</span>
@@ -1865,13 +1970,13 @@
         const max = Math.max(1, ...entries.map((e) => e.totalMs));
         const rows = entries.map((e) => `
           <div style="display:flex; align-items:center; gap:7px; padding:2px 0; font-size:11px;">
-            <span style="width:56px; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(e.name)}</span>
+            <span title="${escapeHtml(e.name)}" style="width:56px; flex-shrink:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(e.name)}</span>
             <span style="flex:1; height:6px; border-radius:3px; background:rgba(255,255,255,0.07); overflow:hidden;">
               <span style="display:block; height:100%; width:${Math.max(3, (e.totalMs / max) * 100)}%; background:${e.color};"></span>
             </span>
             <span style="width:46px; text-align:right; opacity:0.8; font-variant-numeric:tabular-nums;">${formatDuration(Math.round(e.totalMs / 1000))}</span>
           </div>`).join("");
-        // The GM bar above combines monster time with any dm-recategorized
+        // The GM bar above combines monster time with any gm-recategorized
         // time (that combination is a deliberate, closed decision - see
         // gmTotalStats()). This is the only place that isolates just the
         // creatures' own share of it, only computed when actually shown.
@@ -1886,11 +1991,16 @@
 
       const top = entries.slice(0, 3)
         .map((e) => `${escapeHtml(e.name)} ${formatDuration(Math.round(e.totalMs / 1000))}`).join(" · ");
+      // Full list, not just the top 3 - the tooltip for whichever of the two
+      // (truncated "top 3" text, or the collapsed "N entries" count) is
+      // currently shown, so nothing here is a dead end.
+      const allNamed = entries
+        .map((e) => `${e.name} ${formatDuration(Math.round(e.totalMs / 1000))}`).join(" · ");
 
       el.innerHTML = `
         <div style="display:flex; height:10px; border-radius:3px; overflow:hidden;">${strip}</div>
         <div style="display:flex; justify-content:space-between; gap:8px; font-size:10px; opacity:0.6; margin-top:6px;">
-          <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${ui.summaryOpen ? `${entries.length} entries` : top}</span>
+          <span title="${escapeHtml(allNamed)}" style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${ui.summaryOpen ? `${entries.length} entries` : top}</span>
           <span id="ctp-summary-toggle" style="cursor:pointer; opacity:0.85; flex-shrink:0;">Details ${ui.summaryOpen ? "▴" : "▾"}</span>
         </div>
         ${detail}`;
@@ -1910,7 +2020,12 @@
     ];
     function segmentMatchesFilter(seg) {
       if (segFilter === "setup") return seg.category === "setup" || seg.category === "ignore";
-      if (segFilter === "reassigned") return !!seg.overrideOwnerId || seg.category === "dm" || seg.category === "team";
+      // A "gm" category on an owned segment (ownerId set) means a human
+      // manually recategorized it - that's the anomaly worth surfacing. A
+      // genuinely unowned combatant's own turn is ALSO "gm" by default now
+      // (see defaultCategory()), but that's every routine monster turn, not
+      // a manual intervention, so it's deliberately excluded here.
+      if (segFilter === "reassigned") return !!seg.overrideOwnerId || (seg.category === "gm" && seg.ownerId != null) || seg.category === "team";
       if (segFilter === "long") return segMs(seg) >= 60_000;
       return true;
     }
@@ -1986,11 +2101,11 @@
     }
 
     function categoryPickerHTML(seg) {
-      // "setup" is DM-only (see CATEGORY_META / defaultCategory()) - never
+      // "setup" is GM-only (see CATEGORY_META / defaultCategory()) - never
       // offered as a choice on a segment a player owns.
-      const dmOwned = !resolvedOwner(seg);
+      const gmOwned = !resolvedOwner(seg);
       const cats = Object.entries(CATEGORY_META)
-        .filter(([key]) => key !== "setup" || dmOwned)
+        .filter(([key]) => key !== "setup" || gmOwned)
         .map(([key, meta]) => {
         const active = seg.category === key;
         const label = key === "player" ? `${meta.label}…` : meta.label;
@@ -2021,18 +2136,25 @@
       const triggerIcon = seg.trigger === "pause" ? "⏸ "
         : seg.trigger === "split" ? "✂️ "
         : (seg.trigger === "unpause" || seg.trigger === "resume") ? "▶ " : "";
-      const who = seg.combatantId ? escapeHtml(seg.combatantName) : "(no combat)";
-      const override = seg.overrideOwnerId
-        ? ` <span style="color:${getCombatantColor(seg.overrideOwnerId)};">→ ${escapeHtml(ownerName(seg.overrideOwnerId))}</span>`
+      const technicalName = seg.combatantId ? seg.combatantName : "(no combat)";
+      // A manually reassigned segment reads primarily as whoever it's NOW
+      // credited to, not the technical combatant it structurally came from -
+      // the origin is still shown, just demoted to a muted secondary note
+      // instead of the main label, so the row doesn't look like it's still
+      // that combatant's own time.
+      const primaryName = seg.overrideOwnerId ? ownerName(seg.overrideOwnerId) : technicalName;
+      const origin = seg.overrideOwnerId
+        ? ` <span style="opacity:0.45;">(from ${escapeHtml(technicalName)})</span>`
         : "";
       const defeated = seg.defeated ? " 💀" : "";
       const dur = formatDuration(Math.round(segMs(seg) / 1000));
+      const fullText = seg.overrideOwnerId ? `${primaryName} (from ${technicalName})` : primaryName;
       return `
         <div data-anchor-seg="${seg.id}" style="padding:4px 0;">
           <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
             <span style="opacity:0.45; font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0;">${formatClock(seg.start)}</span>
-            <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-              ${triggerIcon}${who}${override}${defeated}${live ? " ●" : ""}
+            <span title="${escapeHtml(fullText)}" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+              ${triggerIcon}${escapeHtml(primaryName)}${origin}${defeated}${live ? " ●" : ""}
             </span>
             <span ${live ? `data-live-dur="${seg.id}"` : ""} style="opacity:0.85; font-variant-numeric:tabular-nums; flex-shrink:0;">${dur}</span>
             ${categoryChipHTML(seg)}
@@ -2060,14 +2182,23 @@
       if (g.segments.length === 1) {
         const seg = g.segments[0];
         const total = formatDuration(Math.round(segMs(seg) / 1000));
+        // `who` already resolves overrideOwnerId (via resolvedOwner()), so a
+        // reassigned segment now reads primarily as whoever it's credited to
+        // - the technical combatant is demoted to a muted "(from ...)" note
+        // instead of a second, redundant mention of the same assignee.
+        const primaryName = seg.overrideOwnerId ? who : seg.combatantName;
+        const secondaryName = seg.overrideOwnerId ? seg.combatantName : who;
+        const secondary = secondaryName
+          ? ` <span style="opacity:0.45;">${seg.overrideOwnerId ? `(from ${escapeHtml(secondaryName)})` : escapeHtml(secondaryName)}</span>`
+          : "";
+        const fullText = secondaryName ? `${primaryName} ${seg.overrideOwnerId ? `(from ${secondaryName})` : secondaryName}` : primaryName;
         return `
           <div data-anchor-group="${g.key}" style="border-bottom:1px solid rgba(255,255,255,0.05); padding:6px 10px;">
             <div style="display:flex; align-items:center; gap:6px; font-size:11px;">
               <span style="opacity:0.45; font-size:10px; font-variant-numeric:tabular-nums; flex-shrink:0;">${formatClock(seg.start)}</span>
               ${dot}
-              <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-                ${escapeHtml(seg.combatantName)}${who ? ` <span style="opacity:0.45;">${escapeHtml(who)}</span>` : ""}
-                ${seg.overrideOwnerId ? ` <span style="color:${getCombatantColor(seg.overrideOwnerId)};">→ ${escapeHtml(ownerName(seg.overrideOwnerId))}</span>` : ""}
+              <span title="${escapeHtml(fullText)}" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                ${escapeHtml(primaryName)}${secondary}
                 ${seg.defeated ? " 💀" : ""}${live ? " ●" : ""}
               </span>
               <span ${live ? `data-live-dur="${seg.id}"` : ""} style="font-variant-numeric:tabular-nums; flex-shrink:0; opacity:0.85;">${total}</span>
@@ -2112,13 +2243,26 @@
              ${proportionalSegmentsHtml(countable.map((s) => ({ ms: segMs(s), color: chipColor(s) })), Infinity)}
            </span>`
         : "";
+      // Same primary/secondary swap as the single-segment row above, driven
+      // by the OPENER's own override - a child segment elsewhere in the
+      // group being reassigned is already flagged by the composition chip,
+      // and shows correctly once expanded, without changing what the
+      // collapsed header's own name line says.
+      const openerPrimary = opener.overrideOwnerId ? who : opener.combatantName;
+      const openerSecondaryName = opener.overrideOwnerId ? opener.combatantName : who;
+      const openerSecondary = openerSecondaryName
+        ? ` <span style="opacity:0.45;">${opener.overrideOwnerId ? `(from ${escapeHtml(openerSecondaryName)})` : escapeHtml(openerSecondaryName)}</span>`
+        : "";
+      const headerFullText = openerSecondaryName
+        ? `${openerPrimary} ${opener.overrideOwnerId ? `(from ${openerSecondaryName})` : openerSecondaryName} · ${partsLabel}`
+        : `${openerPrimary} · ${partsLabel}`;
       const header = `
         <div data-group-row data-group="${g.key}" data-anchor-group="${g.key}" style="display:flex; align-items:center; gap:6px;
              padding:6px 10px; font-size:11px; cursor:pointer;">
           <span style="opacity:0.5; width:9px; flex-shrink:0;">${expanded ? "▾" : "▸"}</span>
           ${dot}
-          <span style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-            ${escapeHtml(opener.combatantName)}${who ? ` <span style="opacity:0.45;">${escapeHtml(who)}</span>` : ""}
+          <span title="${escapeHtml(headerFullText)}" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+            ${escapeHtml(openerPrimary)}${openerSecondary}
             <span style="opacity:0.4;"> · ${partsLabel}</span>
             ${live ? " ●" : ""}
           </span>
@@ -2237,11 +2381,22 @@
       host.querySelectorAll("[data-group]").forEach((node) => {
         node.addEventListener("click", () => {
           const key = node.dataset.group;
+          const expanding = !expandedGroups.has(key);
           if (expandedGroups.has(key)) expandedGroups.delete(key);
           else expandedGroups.add(key);
           openCatSegId = null;
           playerPickerSegId = null;
           renderPanel();
+          if (expanding) {
+            // renderPanel()'s own anchor-preserve logic keeps the header
+            // pinned where it was, which leaves everything newly revealed
+            // hidden below the fold - scroll the group's last row into view
+            // instead, so expanding doesn't require a separate manual scroll
+            // to reach the end of it.
+            const headerEl = host.querySelector(`[data-group="${CSS.escape(key)}"]`);
+            const rows = headerEl?.parentElement?.querySelectorAll("[data-anchor-seg]");
+            rows?.[rows.length - 1]?.scrollIntoView({ block: "nearest" });
+          }
         });
       });
       host.querySelectorAll("[data-cat-open]").forEach((node) => {
@@ -2335,7 +2490,7 @@
 
     // The ⋯ overflow menu and "Post report" dropdown otherwise only close via
     // their own button or picking an entry - a click anywhere else left them
-    // open (U-10).
+    // open.
     document.addEventListener("pointerdown", (ev) => {
       if (!panel || !document.body.contains(panel)) return;
       if (!menuOpen && !postMenuOpen) return;
