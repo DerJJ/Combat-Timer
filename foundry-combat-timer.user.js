@@ -2399,13 +2399,33 @@
           }
         });
       });
+      // categoryPickerHTML()'s own chips (and, once open, its player-list
+      // chips) render as extra direct children of the segment's/group's
+      // anchor wrapper, appended after the row itself - opening either one
+      // near the bottom of the list used to leave the newly revealed
+      // buttons below the fold, same problem as expanding a group above.
+      // Scrolling the wrapper's current last child into view covers both
+      // cases uniformly, since whichever picker just opened is always that
+      // last child right after render. The wrapper's attribute (data-anchor-seg
+      // vs. data-anchor-group) has to be read from the click's own ancestor
+      // chain *before* rerendering, not guessed from the id afterward - a
+      // multi-segment group's opening segment gets both a data-anchor-group
+      // (on the collapsed/expanded header) and its own data-anchor-seg (as a
+      // child row once expanded) carrying the *same* id, and a plain id-only
+      // selector would ambiguously match the header instead of that row.
+      const scrollPickerIntoView = (attr, id) => {
+        host.querySelector(`[${attr}="${CSS.escape(id)}"]`)?.lastElementChild?.scrollIntoView({ block: "nearest" });
+      };
       host.querySelectorAll("[data-cat-open]").forEach((node) => {
         node.addEventListener("click", (ev) => {
           ev.stopPropagation();
           const id = node.dataset.catOpen;
-          openCatSegId = openCatSegId === id ? null : id;
+          const opening = openCatSegId !== id;
+          const attr = node.closest("[data-anchor-seg]") ? "data-anchor-seg" : "data-anchor-group";
+          openCatSegId = opening ? id : null;
           playerPickerSegId = null;
           renderPanel();
+          if (opening) scrollPickerIntoView(attr, id);
         });
       });
       host.querySelectorAll("[data-cat]").forEach((node) => {
@@ -2417,8 +2437,11 @@
           if (cat === "player") {
             // Don't assign straight away - open the player list, so the time
             // can go to somebody other than the technical owner.
-            playerPickerSegId = playerPickerSegId === seg.id ? null : seg.id;
+            const opening = playerPickerSegId !== seg.id;
+            const attr = node.closest("[data-anchor-seg]") ? "data-anchor-seg" : "data-anchor-group";
+            playerPickerSegId = opening ? seg.id : null;
             renderPanel();
+            if (opening) scrollPickerIntoView(attr, seg.id);
             return;
           }
           seg.category = cat;
