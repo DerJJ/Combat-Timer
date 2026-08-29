@@ -13,7 +13,7 @@ const {
   buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
   absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
   roundPacingStats, funFactsStats, gmOverheadStats, bucketTimeByOwner, sessionCompareStats,
-  pauseSummaryStats,
+  pauseSummaryStats, campaignLogEntry,
 } = require("../foundry-combat-timer.user.js");
 
 // Minimal segment builder - only the fields a given test actually cares
@@ -323,6 +323,27 @@ test("pauseSummaryStats: no pauses at all", () => {
   assert.equal(stats.count, 0);
   assert.equal(stats.totalMs, 0);
   assert.equal(stats.longest, null);
+});
+
+test("campaignLogEntry reduces perCombatantStats() output into the campaign log's tiny shape", () => {
+  const perCombatantEntries = [
+    { id: "p1", totalMs: 3000, turnCount: 3 },
+    { id: "p2", totalMs: 1000, turnCount: 1 },
+  ];
+  const entry = campaignLogEntry(12345, 5000, 2, perCombatantEntries);
+  assert.equal(entry.endedAt, 12345);
+  assert.equal(entry.totalMs, 5000);
+  assert.equal(entry.roundCount, 2);
+  assert.deepEqual(entry.perOwnerMs, { p1: 3000, p2: 1000 });
+  assert.equal(entry.avgTurnMs, 1000); // (3000+1000) / (3+1) = 1000, weighted across everyone
+  assert.equal(entry.avgRoundMs, 2500); // 5000 / 2
+});
+
+test("campaignLogEntry: no turns or no rounds never divides by zero", () => {
+  const entry = campaignLogEntry(0, 0, 0, []);
+  assert.equal(entry.avgTurnMs, 0);
+  assert.equal(entry.avgRoundMs, 0);
+  assert.deepEqual(entry.perOwnerMs, {});
 });
 
 test("session comparison: the same aggregator applied to two independent sessions never mixes their data", () => {
