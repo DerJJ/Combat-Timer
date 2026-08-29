@@ -13,6 +13,7 @@ const {
   buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
   absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
   roundPacingStats, funFactsStats, gmOverheadStats, bucketTimeByOwner, sessionCompareStats,
+  pauseSummaryStats,
 } = require("../foundry-combat-timer.user.js");
 
 // Minimal segment builder - only the fields a given test actually cares
@@ -291,6 +292,37 @@ test("funFactsStats: quickest/most reactions count genuine out-of-turn credit, e
   assert.equal(facts.quickestReaction.ms, 20);
   assert.equal(facts.mostReactions.ownerId, "p2");
   assert.equal(facts.mostReactions.count, 2); // p1 and p3 each have exactly 1 - the instant-skip does not bump p1 to 2
+});
+
+test("pauseSummaryStats totals paused time/count regardless of category, and finds the longest", () => {
+  const segs = [
+    seg({ id: "p1", trigger: "pause", category: "player", combatantName: "Aria", round: 1, start: 0, end: 3000 }),
+    seg({ id: "p2", trigger: "pause", category: "setup", combatantName: "Boro", round: 2, start: 3000, end: 8000 }),
+    seg({ id: "turn", trigger: "turn", category: "player", start: 8000, end: 9000 }), // not a pause - excluded
+  ];
+  const stats = pauseSummaryStats(segs);
+  assert.equal(stats.count, 2);
+  assert.equal(stats.totalMs, 8000);
+  assert.equal(stats.avgMs, 4000);
+  assert.deepEqual(stats.longest, { ms: 5000, combatantName: "Boro", round: 2 });
+});
+
+test("pauseSummaryStats excludes 'ignore'-category pauses (a wall-clock gap, not a real pause)", () => {
+  const segs = [
+    seg({ id: "real", trigger: "pause", category: "player", combatantName: "Aria", round: 1, start: 0, end: 3000 }),
+    seg({ id: "gap", trigger: "pause", category: "ignore", combatantName: "Aria", round: 1, start: 3000, end: 999999999 }),
+  ];
+  const stats = pauseSummaryStats(segs);
+  assert.equal(stats.count, 1);
+  assert.equal(stats.totalMs, 3000);
+  assert.equal(stats.longest.ms, 3000);
+});
+
+test("pauseSummaryStats: no pauses at all", () => {
+  const stats = pauseSummaryStats([seg({ trigger: "turn" })]);
+  assert.equal(stats.count, 0);
+  assert.equal(stats.totalMs, 0);
+  assert.equal(stats.longest, null);
 });
 
 test("session comparison: the same aggregator applied to two independent sessions never mixes their data", () => {

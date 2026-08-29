@@ -543,6 +543,28 @@
     return { longestTurn, shortestTurn, slowestAvg, longestWait, avgWaitMs, quickestReaction, mostReactions };
   }
 
+  // Total paused time, how many pauses happened, and the single longest one
+  // - a session-wide interruption summary, independent of category (a pause
+  // later reassigned to Team/Setup/GM still counts as time the game was
+  // actually paused). Excludes "ignore"-category pauses: those exist
+  // specifically for a wall-clock gap that isn't real time (e.g. the
+  // session resumed days later - see the Categorization section), and would
+  // otherwise make "longest pause" a meaningless multi-day outlier. Needs no
+  // owner/name resolution at all - combatantName is already stored raw on
+  // the segment - so unlike most of the other report aggregators this one
+  // needs nothing from init() beyond formatting.
+  function pauseSummaryStats(segs) {
+    let totalMs = 0, count = 0, longest = null;
+    for (const seg of segs) {
+      if (seg.trigger !== "pause" || seg.category === "ignore") continue;
+      const ms = segMs(seg);
+      totalMs += ms;
+      count += 1;
+      if (!longest || ms > longest.ms) longest = { ms, combatantName: seg.combatantName, round: seg.round };
+    }
+    return { totalMs, count, avgMs: count ? totalMs / count : 0, longest };
+  }
+
   // Wall-clock span of the whole session: first segment start to last
   // segment end (or now, if still running) - "how long did this take overall".
   function sessionTotalMs(segs) {
@@ -1748,6 +1770,46 @@
         title: "🎉 Fun Facts",
         subtitle: `Total ${formatDuration(Math.round(sessionTotalMs(segs) / 1000))}`,
         body: hasAnyFact ? `<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:2px;">${tiles}</div>` : "",
+      });
+    }
+
+    // Three tiles built on the pure pauseSummaryStats(segs) aggregator -
+    // total paused time (with the average pause length alongside, for
+    // scale), how many pauses happened, and the single longest one (with
+    // who was on the clock and the round it happened in, when known). Needs
+    // no ownerId/color resolution the way the other reports' tiles do -
+    // pauseSummaryStats() already carries the longest pause's raw
+    // combatantName, so this is pure presentation over what it returns.
+    function buildPauseSummaryContent() {
+      const segs = allSegments();
+      const stats = pauseSummaryStats(segs);
+
+      const tile = (icon, label, value, sub = "") => `
+        <div style="background:rgba(255,255,255,0.05) !important; border-radius:6px; padding:6px 8px;">
+          <div style="font-size:9px; opacity:0.55; color:#eee !important;">${icon} ${label}</div>
+          <div style="font-size:11px; font-weight:600; color:#eee !important;">${value}</div>
+          ${sub ? `<div style="font-size:9px; opacity:0.45; margin-top:1px; color:#eee !important;">${sub}</div>` : ""}
+        </div>`;
+
+      let body = "";
+      if (stats.count > 0) {
+        const longestSub = [
+          stats.longest.combatantName && stats.longest.combatantName !== "–" ? escapeHtml(stats.longest.combatantName) : null,
+          stats.longest.round != null ? `Round ${stats.longest.round}` : null,
+        ].filter(Boolean).join(" · ");
+
+        const tiles = [
+          tile("⏸️", "Total paused", formatDuration(Math.round(stats.totalMs / 1000)), `Ø ${formatDuration(Math.round(stats.avgMs / 1000))} each`),
+          tile("🔢", "Pause count", `${stats.count}`),
+          tile("⏱️", "Longest pause", formatDuration(Math.round(stats.longest.ms / 1000)), longestSub),
+        ].join("");
+        body = `<div style="display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; margin-top:2px;">${tiles}</div>`;
+      }
+
+      return wrapCard({
+        title: "⏸️ Pauses",
+        subtitle: `Total ${formatDuration(Math.round(sessionTotalMs(segs) / 1000))}`,
+        body,
       });
     }
 
@@ -3414,6 +3476,7 @@
         { key: "rounds", label: "📈 Round pacing — time per round" },
         { key: "facts", label: "🎉 Fun facts — extremes for the session" },
         { key: "gmoverhead", label: "🎲 GM overhead — monsters, setup, manual" },
+        { key: "pauses", label: "⏸️ Pauses — total, count, longest" },
         { key: "recent", label: "🔀 Recent combats — compare sessions", disabled: !canCompare, hint: canCompare ? null : "needs an archived session" },
       ];
       el.innerHTML = `
@@ -3440,7 +3503,7 @@
           renderPanel();
           const builders = {
             bars: buildBarsContent, players: buildPlayerListContent, rounds: buildRoundPacingContent,
-            facts: buildFunFactsContent, gmoverhead: buildGmOverheadContent,
+            facts: buildFunFactsContent, gmoverhead: buildGmOverheadContent, pauses: buildPauseSummaryContent,
           };
           await postToChat(builders[kind](), kind);
           toast("Posted to chat — only you can see it.");
@@ -3496,7 +3559,7 @@
       lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
       buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
       absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats, roundPacingStats,
-      funFactsStats, gmOverheadStats, bucketTimeByOwner, sessionCompareStats,
+      funFactsStats, gmOverheadStats, bucketTimeByOwner, sessionCompareStats, pauseSummaryStats,
     };
   }
 })();
