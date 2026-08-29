@@ -60,10 +60,11 @@ Top to bottom, the panel reads in the order things are scoped:
 
 ### Chat reports
 
-The Post report button offers two reports, visible only to you at first ("self roll" / whisper to yourself). Right-click your own message in the chat log and choose **Reveal to Everyone** if you want to share it — Foundry handles that natively, no extra step needed on our side.
+The Post report button offers three reports, visible only to you at first ("self roll" / whisper to yourself). Right-click your own message in the chat log and choose **Reveal to Everyone** if you want to share it — Foundry handles that natively, no extra step needed on our side.
 
 - **Bar chart**: total time per player plus one combined GM bar, sorted by time spent, with a percentage of the session total next to each. If a player controls more than one token (a character plus a familiar or summon), their bar splits into one segment per token — their own character always rightmost in their full color, other tokens trailing to the left in progressively darker shades, labelled by name where they're wide enough. Past four tokens the smallest are merged into a single "+N more" segment, since more shades than that stop being tellable apart. A thin second row appears under a player's bar whenever they have any paused or reassigned ("out-of-turn") time, breaking each token's segment down further so you can see at a glance how much of it was normal turn time versus a pause or a reassignment; a small legend under the chart says which colour is which.
 - **Player list**: per player, average turn length, average gap between their turns, and total time spent waiting.
+- **Round pacing**: one bar per combat round, sized relative to the longest round so a fight that bogs down as it escalates is visible at a glance. Each bar splits into that round's contributors (players, GM/monsters, Team, Setup) in their own real colors, so the same person's color means the same thing here as in the bar chart above; past four contributors in one round the smallest are merged into a single "+N more" segment, in a neutral grey since they're different people rather than shades of one.
 
 ### A new combat, a new session
 
