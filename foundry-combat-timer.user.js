@@ -147,14 +147,14 @@
     return (seg.end ?? Date.now()) - seg.start;
   }
 
-  const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one
+  const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one - default; user-adjustable via ui.setupPauseThresholdMs (see Settings)
   // Setup is a GM-only category (see CATEGORY_META in init()) - a segment
   // with a player owner can never default to, or inherit, "setup".
-  function defaultCategory(trigger, prevSegment, ownerId) {
+  function defaultCategory(trigger, prevSegment, ownerId, threshold = SETUP_PAUSE_THRESHOLD_MS) {
     if (trigger === "pause") {
       const gmOwned = !ownerId;
       const prevDur = prevSegment ? segMs(prevSegment) : Infinity;
-      if (gmOwned && prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
+      if (gmOwned && prevDur < threshold) return "setup";
       // "ignore" is manual-only - a live pause is real time and must never
       // silently inherit it from the segment before.
       if (prevSegment && prevSegment.category !== "ignore" && (gmOwned || prevSegment.category !== "setup")) {
@@ -792,14 +792,12 @@
       return gm ? gm.color.css : "#c0392b";
     }
 
-    const SHORT_PAUSE_MERGE_THRESHOLD_MS = 3000; // a pause shorter than this is noise (toggle lag, a misclick) - fold it into whatever ran right before instead of showing it as its own segment
-
     function closeSegment() {
       if (!currentSegment) return;
       liveDirty = true;
       currentSegment.end = currentSegment.end ?? Date.now();
       const prev = segments[segments.length - 1] ?? null;
-      if (currentSegment.trigger === "pause" && prev && segMs(currentSegment) < SHORT_PAUSE_MERGE_THRESHOLD_MS) {
+      if (currentSegment.trigger === "pause" && prev && segMs(currentSegment) < ui.shortPauseMergeThresholdMs) {
         // Too short to be a meaningful pause - absorb it into whatever was
         // running right before instead of leaving a tiny segment behind.
         prev.end = currentSegment.end;
@@ -850,7 +848,7 @@
         actorType: combatant?.actor?.type ?? null,
         ownerId,
         defeated: combatant?.isDefeated ?? false,
-        category: defaultCategory(trigger, prev, ownerId),
+        category: defaultCategory(trigger, prev, ownerId, ui.setupPauseThresholdMs),
       });
     }
 
@@ -1681,7 +1679,11 @@
     function uiStorageKey() {
       return `ctp-ui-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
-    const UI_DEFAULTS = { left: null, top: 60, panelWidth: 300, segHeight: 240, summaryOpen: false, maxArchivedSessions: 10 };
+    const UI_DEFAULTS = {
+      left: null, top: 60, panelWidth: 300, segHeight: 240, summaryOpen: false, maxArchivedSessions: 10,
+      shortPauseMergeThresholdMs: 3000, // a pause shorter than this is noise (toggle lag, a misclick) - folded into whatever ran right before instead of shown as its own segment
+      setupPauseThresholdMs: SETUP_PAUSE_THRESHOLD_MS,
+    };
     // Past this, each further +5 step needs an explicit confirm - each
     // archived session is its own localStorage key, so a very high cap
     // quietly grows browser storage usage with no other warning.
@@ -1714,6 +1716,7 @@
     let menuOpen = false;               // the ⋯ overflow menu
     let postMenuOpen = false;           // the "Post report" dropdown
     let archivePickerOpen = false;      // the "Archived" session list
+    let settingsPickerOpen = false;     // the tracking-thresholds settings section
     let importUndo = null;              // one-level undo snapshot taken right before an import
     let lastSegSig = null;              // see renderSegments(): skips the rebuild when nothing changed
     let toastTimer = null;
@@ -1893,6 +1896,9 @@
         </div>
 
         <div id="ctp-menu" style="display:none; background:${THEME.sectionBg}; border-bottom:1px solid ${THEME.border}; padding:4px;"></div>
+
+        <div id="ctp-settings" style="display:none; font-size:11px;
+             background:${THEME.sectionBg}; border-bottom:1px solid ${THEME.border}; padding:4px;"></div>
 
         <div id="ctp-tabs" style="display:flex; gap:4px; padding:6px 8px; background:${THEME.sectionBg};
              border-bottom:1px solid ${THEME.border}; font-size:11px;"></div>
@@ -2132,6 +2138,7 @@
         ...(importUndo ? [{ key: "undo", label: "↩ Undo last import" }] : []),
         { key: "dummy", label: "🧪 Load dummy data", hint: "only if empty" },
         { key: "resetpos", label: "📍 Reset panel position" },
+        { key: "settings", label: "⚙️ Settings" },
       ];
       el.innerHTML = items.map((it) => `
         <div data-menu="${it.key}" data-hover style="cursor:pointer; padding:5px 7px; border-radius:5px;
@@ -2159,6 +2166,53 @@
             persistUi();
             applyPanelPosition();
           }
+          else if (action === "settings") settingsPickerOpen = !settingsPickerOpen;
+          renderPanel();
+        });
+      });
+    }
+
+    // Adjustable tracking-logic thresholds - opened from the "Settings" entry
+    // in the ⋯ menu. Follows the same −/+ stepper pattern as the archive-cap
+    // control in renderArchiveList(), just with two rows instead of one.
+    const SETTINGS_ROWS = [
+      {
+        key: "shortPauseMergeThresholdMs",
+        label: "Merge pauses shorter than",
+        hint: "A pause this short is dropped - absorbed into whatever ran right before it instead of shown as its own segment.",
+        min: 0, max: 30000, step: 1000,
+      },
+      {
+        key: "setupPauseThresholdMs",
+        label: "Assume Setup for pauses after segments shorter than",
+        hint: "Guesses a pause is GM downtime (round-boundary), not a mid-decision interruption, when the segment right before it was this short.",
+        min: 0, max: 60000, step: 1000,
+      },
+    ];
+    function renderSettings() {
+      const el = panel.querySelector("#ctp-settings");
+      el.style.display = settingsPickerOpen ? "block" : "none";
+      if (!settingsPickerOpen) return;
+      el.innerHTML = SETTINGS_ROWS.map((r) => `
+        <div style="padding:4px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+            <span>${r.label}</span>
+            <span style="display:flex; align-items:center; gap:4px; flex-shrink:0;">
+              <span data-setting="${r.key}" data-delta="${-r.step}" data-hover style="cursor:pointer; padding:0 5px; border-radius:4px;">−</span>
+              <span style="font-variant-numeric:tabular-nums; min-width:2.5em; text-align:center;">${Math.round(ui[r.key] / 1000)}s</span>
+              <span data-setting="${r.key}" data-delta="${r.step}" data-hover style="cursor:pointer; padding:0 5px; border-radius:4px;">+</span>
+            </span>
+          </div>
+          <div style="opacity:0.55; font-size:10px; margin-top:1px;">${r.hint}</div>
+        </div>`).join("");
+      el.querySelectorAll("[data-setting]").forEach((node) => {
+        node.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const key = node.dataset.setting;
+          const delta = Number(node.dataset.delta);
+          const row = SETTINGS_ROWS.find((r) => r.key === key);
+          ui[key] = Math.min(row.max, Math.max(row.min, ui[key] + delta));
+          persistUi();
           renderPanel();
         });
       });
@@ -2910,6 +2964,7 @@
       persist();
       if (!panelVisible || !document.body.contains(panel)) return;
       renderMenu();
+      renderSettings();
       renderTabs();
       renderArchiveList();
       renderLive();
@@ -2927,11 +2982,12 @@
     // open.
     document.addEventListener("pointerdown", (ev) => {
       if (!panel || !document.body.contains(panel)) return;
-      if (!menuOpen && !postMenuOpen && !archivePickerOpen) return;
-      if (ev.target.closest("#ctp-menu, #ctp-menu-btn, #ctp-post-menu, #ctp-post, #ctp-archive-list, #ctp-archive-toggle")) return;
+      if (!menuOpen && !postMenuOpen && !archivePickerOpen && !settingsPickerOpen) return;
+      if (ev.target.closest("#ctp-menu, #ctp-menu-btn, #ctp-post-menu, #ctp-post, #ctp-archive-list, #ctp-archive-toggle, #ctp-settings")) return;
       menuOpen = false;
       postMenuOpen = false;
       archivePickerOpen = false;
+      settingsPickerOpen = false;
       renderPanel();
     });
   }
