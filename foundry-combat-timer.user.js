@@ -256,6 +256,299 @@
     return Math.round(Math.min(maxMs, Math.max(minMs, val)));
   }
 
+  // ---- Pure session-stats aggregators ----------------------------------
+  // Every one of these used to read allSegments() (init()'s own "whichever
+  // session is currently selected" accessor) directly. They now take the
+  // segment list as a `segs` parameter instead - same result for every
+  // existing call site (which all just pass allSegments()), but it also
+  // means the exact same aggregator can be called twice with two different
+  // sessions' segments (e.g. a future session-over-session comparison
+  // report) instead of only ever being able to see whatever's selected in
+  // the panel right now. Left out of this group: perCombatantStats() (still
+  // inside init() - it resolves ownerName()/getCombatantColor() from
+  // game.users, so it can't be fully closure-free) and getCombatPlayers()
+  // (a live-roster UI helper, not a session-stats aggregator).
+
+  // For each combatantId, who resolvedOwner() credited its most recent real
+  // (non-instant-skip) turn to. Recomputed fresh every call - not cached -
+  // so it always reflects the latest known ownership, including a manual
+  // reassignment made after the fact via the player picker.
+  function lastLiveOwnerByCombatant(segs) {
+    const map = new Map();
+    for (const seg of segs) {
+      if (isRealTurn(seg)) map.set(seg.combatantId, resolvedOwner(seg));
+    }
+    return map;
+  }
+  // Like resolvedOwner(), but with two differences. First, a defeated
+  // NPC's instant-skip inherits whoever owned its last real turn (possibly
+  // nobody, i.e. the GM/Monsters bucket) instead of always reading as
+  // unclaimed - this is what stops that time from silently vanishing from
+  // every total. Second, a manual "gm" recategorization always wins over
+  // the segment's own technical ownerId - that's the entire point of
+  // flagging a player's own turn as "this was really the GM's time, not
+  // theirs" (defaultCategory() only ever hands out "gm" on its own to an
+  // already-unowned combatant, so ownerId is only non-null here when a
+  // human explicitly overrode a segment that technically belonged to
+  // someone) - without this, ignoring the override would just resolve
+  // straight back to that same player via ownerId, undoing the whole
+  // recategorization. A genuinely unowned "gm" segment (ownerId already
+  // null) falls through to the same defeated-redirect check as any other
+  // unclaimed segment, so that mechanism keeps working unchanged.
+  function effectiveOwner(seg, lastLiveOwner) {
+    if (seg.overrideOwnerId) return seg.overrideOwnerId;
+    if (seg.category !== "gm" && seg.ownerId) return seg.ownerId;
+    if (seg.defeated) return lastLiveOwner.get(seg.combatantId) ?? null;
+    return null;
+  }
+
+  function npcAggregate(segs) {
+    let totalMs = 0, turns = 0;
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    for (const seg of segs) {
+      // ownerId (not resolvedOwner/effectiveOwner) - this isolates a
+      // genuinely unowned creature's own turn from a technically-owned
+      // segment a human manually flagged "gm" (that one belongs in
+      // gmTotalStats()'s combined total, but isn't "a monster's turn").
+      if (seg.ownerId != null || !hasCombatContext(seg)) continue;
+      if (seg.category !== "player" && seg.category !== "gm") continue;
+      if (effectiveOwner(seg, lastLiveOwner) !== null) continue; // claimed by someone -> perCombatantStats/gmTotalStats("gm") instead
+      totalMs += segMs(seg);
+      // isTurnStart() too - see gmTotalStats() - so a pause/unpause/split
+      // inside one monster's turn doesn't count as several turns.
+      if (isRealTurn(seg) && isTurnStart(seg)) turns += 1; // an instant-skip's brief duration still counts toward totalMs, but never masquerades as "a turn"
+    }
+    return { totalS: Math.round(totalMs / 1000), turns, avgS: turns ? Math.round(totalMs / turns / 1000) : 0 };
+  }
+
+  // Raw totals for the two categories nobody else already aggregates -
+  // "gm" is covered by gmTotalStats()/countsForGM() instead, so it isn't
+  // tracked here. Deliberately does not gate on hasCombatContext() like
+  // the other aggregates - team/setup time commonly has no combatantId at
+  // all (pre-combat prep, between-encounter housekeeping), and that's
+  // exactly the time these categories exist to capture, not an edge case
+  // to drop.
+  function categoryTotals(segs) {
+    const t = { team: 0, setup: 0 };
+    for (const seg of segs) if (seg.category in t) t[seg.category] += segMs(seg);
+    return { teamMs: t.team, setupMs: t.setup };
+  }
+
+  // Partitions the whole timeline into turn slots, independent of who ends
+  // up owning any individual segment inside one. A slot starts at every
+  // "turn"/"resume" segment (a genuine new turn beginning) and absorbs
+  // every following segment - pause/unpause/split, or a reassigned chunk -
+  // until the next one. The very first segment always opens slot 1;
+  // trailing segments after the last trigger stay in the last slot.
+  // designatedOwner is the TECHNICAL (non-overridden) owner of whoever's
+  // turn this structurally was - it never changes due to reassignment.
+  function buildTurnSlots(segs) {
+    const slots = [];
+    let afterIgnored = false;
+    for (const seg of segs) {
+      if (seg.category === "ignore") {
+        // A wall-clock gap someone manually marked as not real time (e.g.
+        // the session resumed days later) - never becomes part of any
+        // slot, and never lets one slot span across it either.
+        afterIgnored = true;
+        continue;
+      }
+      if (!slots.length || isTurnStart(seg) || afterIgnored) {
+        slots.push({ designatedOwner: seg.ownerId ?? null, start: seg.start, end: seg.end ?? Date.now(), segments: [seg] });
+      } else {
+        const slot = slots[slots.length - 1];
+        slot.end = seg.end ?? Date.now();
+        slot.segments.push(seg);
+      }
+      afterIgnored = false;
+    }
+    return slots;
+  }
+
+  // Shared by betweenTurnStats() and turnWindowStats(): each player's own
+  // real turn-opening slots, grouped by owner, plus the whole session's
+  // span. A slot's designatedOwner comes straight from the opening
+  // segment's raw ownerId regardless of category - a stray "setup" blip
+  // (e.g. a tracker mis-click) still carries a real player's id and would
+  // otherwise be mistaken for one of "their" turn boundaries.
+  function ownTurnSlotsByOwner(segs) {
+    const slots = buildTurnSlots(segs);
+    const byOwner = new Map();
+    for (const s of slots) {
+      if (!s.designatedOwner || s.segments[0].category !== "player" || !isRealTurn(s.segments[0]) || !isTurnStart(s.segments[0])) continue;
+      if (!byOwner.has(s.designatedOwner)) byOwner.set(s.designatedOwner, []);
+      byOwner.get(s.designatedOwner).push(s);
+    }
+    const spanStart = slots.length ? Math.min(...slots.map((s) => s.start)) : 0;
+    const spanEnd = slots.length ? Math.max(...slots.map((s) => s.end)) : 0;
+    return { byOwner, spanStart, spanEnd };
+  }
+
+  function betweenTurnStats(segs) {
+    const { byOwner, spanStart, spanEnd } = ownTurnSlotsByOwner(segs);
+    const result = new Map();
+    for (const [id, list] of byOwner) {
+      list.sort((a, b) => a.start - b.start);
+      let sum = 0, count = 0;
+      for (let i = 0; i < list.length - 1; i++) {
+        const gap = list[i + 1].start - list[i].end;
+        if (gap > 0) { sum += gap; count += 1; }
+      }
+      const wrap = (list[0].start - spanStart) + (spanEnd - list[list.length - 1].end);
+      if (wrap > 0) { sum += wrap; count += 1; }
+      result.set(id, { avgMs: count ? sum / count : 0, count });
+    }
+    return result;
+  }
+
+  // Fences each player's own timeline into one window per turn, the same
+  // way a "round" was defined for them from the start: a turn's window
+  // runs from the end of their PREVIOUS turn (or the session start, for
+  // their first) through the end of THIS turn - so anything credited to
+  // them out-of-turn in between (e.g. an Attack of Opportunity) belongs to
+  // the turn whose window it fell in, not floating outside every turn.
+  // The last turn has no "next" turn to hand off to, so its window keeps
+  // absorbing time through the end of the session instead of stopping at
+  // its own turn's end - trailing activity still counts toward the turn
+  // that precedes it. Because these windows partition the player's
+  // entire credited timeline with no gaps or overlaps, the sum across all
+  // of them is always exactly perCombatantStats()'s totalMs for that
+  // player - so the average this returns can never disagree with the
+  // total shown next to it, unlike a plain inTurnMs/turnCount average.
+  function turnWindowStats(segs) {
+    const { byOwner, spanStart, spanEnd } = ownTurnSlotsByOwner(segs);
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+
+    const result = new Map();
+    for (const [owner, list] of byOwner) {
+      list.sort((a, b) => a.start - b.start);
+      const windows = list.map((slot, i) => ({
+        turnIndex: i + 1,
+        start: i === 0 ? spanStart : list[i - 1].end,
+        end: i === list.length - 1 ? spanEnd : slot.end,
+        ms: 0,
+      }));
+      for (const seg of segs) {
+        if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg)) continue;
+        if (effectiveOwner(seg, lastLiveOwner) !== owner) continue;
+        // Half-open [start, end) windows chained end-to-end - every
+        // credited segment's start falls in exactly one, except a
+        // zero-duration edge case at the very last boundary, which the
+        // fallback folds into the last window rather than dropping.
+        const w = windows.find((win) => seg.start >= win.start && seg.start < win.end) ?? windows[windows.length - 1];
+        w.ms += segMs(seg);
+      }
+      const totalMs = windows.reduce((sum, w) => sum + w.ms, 0);
+      result.set(owner, { windows, avgMs: windows.length ? totalMs / windows.length : 0 });
+    }
+    return result;
+  }
+
+  // Wait = session span minus a player's own active time (in-turn +
+  // out-of-turn combined - both mean "not idle"). "setup" segments are
+  // excluded from active time but stay inside the span, so they read as
+  // wait time for every player. "team" segments are cut out of the span
+  // itself, so shared/group time is invisible to individual wait entirely
+  // (it only shows up via the GM/Team category totals).
+  function absoluteWaitStats(segs) {
+    let spanStart = null, spanEnd = null, teamMs = 0, ignoredMs = 0;
+    for (const seg of segs) {
+      if (!hasCombatContext(seg)) continue;
+      const end = seg.end ?? Date.now();
+      if (spanStart === null || seg.start < spanStart) spanStart = seg.start;
+      if (spanEnd === null || end > spanEnd) spanEnd = end;
+      if (seg.category === "team") teamMs += segMs(seg);
+      if (seg.category === "ignore") ignoredMs += segMs(seg);
+    }
+    if (spanStart === null) return new Map();
+    const span = Math.max(0, (spanEnd - spanStart) - teamMs - ignoredMs);
+
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    const activeMs = new Map();
+    for (const seg of segs) {
+      if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg)) continue;
+      const owner = effectiveOwner(seg, lastLiveOwner);
+      if (!owner) continue;
+      activeMs.set(owner, (activeMs.get(owner) ?? 0) + segMs(seg));
+    }
+    const result = new Map();
+    for (const [id, active] of activeMs) result.set(id, Math.max(0, span - active));
+    return result;
+  }
+
+  // Wall-clock span of the whole session: first segment start to last
+  // segment end (or now, if still running) - "how long did this take overall".
+  function sessionTotalMs(segs) {
+    if (!segs.length) return 0;
+    const start = Math.min(...segs.map((s) => s.start));
+    const end = Math.max(...segs.map((s) => s.end ?? Date.now()));
+    // Excluding an "ignore" segment from the min/max above wouldn't shrink
+    // the span by itself - segments before and after it still anchor the
+    // same start/end. Its duration has to be explicitly subtracted instead.
+    const ignoredMs = segs.filter((s) => s.category === "ignore").reduce((sum, s) => sum + segMs(s), 0);
+    return Math.max(0, (end - start) - ignoredMs);
+  }
+
+  // Shared by gmTotalStats() and gmRoundStats(): does this segment's time
+  // belong to the GM at all - either an unclaimed monster's own turn (the
+  // indirect path) or anything explicitly recategorized to "gm" (the
+  // direct path, e.g. a player's turn or a pause that was really the GM's
+  // time). A GM-direct segment has no combatant by nature - hasCombatContext()
+  // only gates the indirect (unclaimed-monster) path.
+  function countsForGM(seg, lastLiveOwner) {
+    if (effectiveOwner(seg, lastLiveOwner) !== null) return false; // claimed (directly, or via a defeated-instant-skip redirect) -> perCombatantStats instead
+    if (seg.category === "gm") return true;
+    // The lingering "player"-category unclaimed case: a pause segment can
+    // still carry over "player" from whatever ran before it even while
+    // gmOwned (see defaultCategory()'s pause branch), and old/imported
+    // data may predate the "gm" default entirely.
+    return seg.category === "player" && hasCombatContext(seg);
+  }
+
+  // Combined GM total: monster-turn time (not reassigned away) PLUS any
+  // segment explicitly recategorized as "gm". byEntity lets buildBarsContent()
+  // render the GM bar as a stack of per-monster segments, same as a player's
+  // controlled entities. See gmRoundStats() for the GM's per-round average -
+  // unlike a player, the GM has no single "own turn" to fence an average by.
+  function gmTotalStats(segs) {
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    const byEntity = new Map();
+    let ms = 0;
+    for (const seg of segs) {
+      if (!countsForGM(seg, lastLiveOwner)) continue;
+      const segDurMs = segMs(seg);
+      ms += segDurMs;
+      if (!byEntity.has(seg.combatantId)) {
+        byEntity.set(seg.combatantId, { combatantId: seg.combatantId, name: seg.combatantName, ms: 0 });
+      }
+      byEntity.get(seg.combatantId).ms += segDurMs;
+    }
+    return { totalMs: ms, byEntity: [...byEntity.values()] };
+  }
+
+  // The GM's average "per turn" is defined per ROUND, not per individual
+  // monster turn - round 1 is "combat start through the end of round 1",
+  // round 2 is "end of round 1 through end of round 2", and so on. Unlike
+  // a player's turnWindowStats() (which has to compute window boundaries
+  // from turn-slot end times, since a player's own turns are scattered
+  // through the timeline), every segment already carries the round it was
+  // created in (see Segment in AGENTS.md) - rounds are already a
+  // contiguous, gapless partition of the whole session, so grouping by
+  // that field directly IS the fencing. A round with no GM-attributed time
+  // still counts in the denominator (a quiet round still happened), which
+  // is why this can't just reuse gmTotalStats()'s totalMs - it also needs
+  // to know how many rounds occurred at all, not only which had GM time.
+  function gmRoundStats(segs) {
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    const rounds = new Set();
+    let ms = 0;
+    for (const seg of segs) {
+      if (seg.round != null) rounds.add(seg.round);
+      if (countsForGM(seg, lastLiveOwner)) ms += segMs(seg);
+    }
+    return { roundCount: rounds.size, avgMs: rounds.size ? ms / rounds.size : 0 };
+  }
+
   function waitForFoundryReady(cb) {
     function attach() {
       if (window.game?.ready) return cb();
@@ -763,46 +1056,19 @@
       else archiveDirty = true;
     }
 
-    // For each combatantId, who resolvedOwner() credited its most recent real
-    // (non-instant-skip) turn to. Recomputed fresh every time - not cached -
-    // so it always reflects the latest known ownership, including a manual
-    // reassignment made after the fact via the player picker.
-    function lastLiveOwnerByCombatant() {
-      const map = new Map();
-      for (const seg of allSegments()) {
-        if (isRealTurn(seg)) map.set(seg.combatantId, resolvedOwner(seg));
-      }
-      return map;
-    }
-    // Like resolvedOwner(), but with two differences. First, a defeated
-    // NPC's instant-skip inherits whoever owned its last real turn (possibly
-    // nobody, i.e. the GM/Monsters bucket) instead of always reading as
-    // unclaimed - this is what stops that time from silently vanishing from
-    // every total. Second, a manual "gm" recategorization always wins over
-    // the segment's own technical ownerId - that's the entire point of
-    // flagging a player's own turn as "this was really the GM's time, not
-    // theirs" (defaultCategory() only ever hands out "gm" on its own to an
-    // already-unowned combatant, so ownerId is only non-null here when a
-    // human explicitly overrode a segment that technically belonged to
-    // someone) - without this, ignoring the override would just resolve
-    // straight back to that same player via ownerId, undoing the whole
-    // recategorization. A genuinely unowned "gm" segment (ownerId already
-    // null) falls through to the same defeated-redirect check as any other
-    // unclaimed segment, so that mechanism keeps working unchanged.
-    function effectiveOwner(seg, lastLiveOwner) {
-      if (seg.overrideOwnerId) return seg.overrideOwnerId;
-      if (seg.category !== "gm" && seg.ownerId) return seg.ownerId;
-      if (seg.defeated) return lastLiveOwner.get(seg.combatantId) ?? null;
-      return null;
-    }
-
     // One player's turn/entity-time breakdown. "In-turn" = time during a slot
     // this owner was structurally designated for (their own turn, or one of
     // their controlled entities' turns - e.g. a necromancer's summons).
     // "Out-of-turn" = time reassigned to them from someone else's slot (e.g.
     // an Attack of Opportunity). turnCount/byEntity only count designated
     // slots, never out-of-turn credit, so reassignment can't inflate them.
-    function perCombatantStats() {
+    // Kept inside init() (unlike the other aggregators, now above the
+    // waitForFoundryReady bootstrap) because it resolves ownerName()/
+    // getCombatantColor() from game.users, so it can't be made fully
+    // closure-free - but still takes segs as a parameter like the others,
+    // so it can be pointed at any session's data, not just whatever's
+    // currently selected.
+    function perCombatantStats(segs) {
       const map = new Map();
       const getOwner = (id) => {
         if (!map.has(id)) {
@@ -827,8 +1093,8 @@
         return owner.byEntity.get(seg.combatantId);
       };
 
-      const lastLiveOwner = lastLiveOwnerByCombatant();
-      for (const slot of buildTurnSlots()) {
+      const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+      for (const slot of buildTurnSlots(segs)) {
         const opening = slot.segments[0];
         if (slot.designatedOwner && opening.category === "player" && isRealTurn(opening) && isTurnStart(opening)) {
           const owner = getOwner(slot.designatedOwner);
@@ -859,195 +1125,6 @@
         }
       }
       return [...map.values()].map((e) => ({ ...e, byEntity: [...e.byEntity.values()] }));
-    }
-
-    function npcAggregate() {
-      let totalMs = 0, turns = 0;
-      const lastLiveOwner = lastLiveOwnerByCombatant();
-      for (const seg of allSegments()) {
-        // ownerId (not resolvedOwner/effectiveOwner) - this isolates a
-        // genuinely unowned creature's own turn from a technically-owned
-        // segment a human manually flagged "gm" (that one belongs in
-        // gmTotalStats()'s combined total, but isn't "a monster's turn").
-        if (seg.ownerId != null || !hasCombatContext(seg)) continue;
-        if (seg.category !== "player" && seg.category !== "gm") continue;
-        if (effectiveOwner(seg, lastLiveOwner) !== null) continue; // claimed by someone -> perCombatantStats/gmTotalStats("gm") instead
-        totalMs += segMs(seg);
-        // isTurnStart() too - see gmTotalStats() - so a pause/unpause/split
-        // inside one monster's turn doesn't count as several turns.
-        if (isRealTurn(seg) && isTurnStart(seg)) turns += 1; // an instant-skip's brief duration still counts toward totalMs, but never masquerades as "a turn"
-      }
-      return { totalS: Math.round(totalMs / 1000), turns, avgS: turns ? Math.round(totalMs / turns / 1000) : 0 };
-    }
-
-    // Raw totals for the two categories nobody else already aggregates -
-    // "gm" is covered by gmTotalStats()/countsForGM() instead, so it isn't
-    // tracked here. Deliberately does not gate on hasCombatContext() like
-    // the other aggregates - team/setup time commonly has no combatantId at
-    // all (pre-combat prep, between-encounter housekeeping), and that's
-    // exactly the time these categories exist to capture, not an edge case
-    // to drop.
-    function categoryTotals() {
-      const t = { team: 0, setup: 0 };
-      for (const seg of allSegments()) if (seg.category in t) t[seg.category] += segMs(seg);
-      return { teamMs: t.team, setupMs: t.setup };
-    }
-
-    // Partitions the whole timeline into turn slots, independent of who ends
-    // up owning any individual segment inside one. A slot starts at every
-    // "turn"/"resume" segment (a genuine new turn beginning) and absorbs
-    // every following segment - pause/unpause/split, or a reassigned chunk -
-    // until the next one. The very first segment always opens slot 1;
-    // trailing segments after the last trigger stay in the last slot.
-    // designatedOwner is the TECHNICAL (non-overridden) owner of whoever's
-    // turn this structurally was - it never changes due to reassignment.
-    function buildTurnSlots() {
-      const slots = [];
-      let afterIgnored = false;
-      for (const seg of allSegments()) {
-        if (seg.category === "ignore") {
-          // A wall-clock gap someone manually marked as not real time (e.g.
-          // the session resumed days later) - never becomes part of any
-          // slot, and never lets one slot span across it either.
-          afterIgnored = true;
-          continue;
-        }
-        if (!slots.length || isTurnStart(seg) || afterIgnored) {
-          slots.push({ designatedOwner: seg.ownerId ?? null, start: seg.start, end: seg.end ?? Date.now(), segments: [seg] });
-        } else {
-          const slot = slots[slots.length - 1];
-          slot.end = seg.end ?? Date.now();
-          slot.segments.push(seg);
-        }
-        afterIgnored = false;
-      }
-      return slots;
-    }
-
-    // Shared by betweenTurnStats() and turnWindowStats(): each player's own
-    // real turn-opening slots, grouped by owner, plus the whole session's
-    // span. A slot's designatedOwner comes straight from the opening
-    // segment's raw ownerId regardless of category - a stray "setup" blip
-    // (e.g. a tracker mis-click) still carries a real player's id and would
-    // otherwise be mistaken for one of "their" turn boundaries.
-    function ownTurnSlotsByOwner() {
-      const slots = buildTurnSlots();
-      const byOwner = new Map();
-      for (const s of slots) {
-        if (!s.designatedOwner || s.segments[0].category !== "player" || !isRealTurn(s.segments[0]) || !isTurnStart(s.segments[0])) continue;
-        if (!byOwner.has(s.designatedOwner)) byOwner.set(s.designatedOwner, []);
-        byOwner.get(s.designatedOwner).push(s);
-      }
-      const spanStart = slots.length ? Math.min(...slots.map((s) => s.start)) : 0;
-      const spanEnd = slots.length ? Math.max(...slots.map((s) => s.end)) : 0;
-      return { byOwner, spanStart, spanEnd };
-    }
-
-    function betweenTurnStats() {
-      const { byOwner, spanStart, spanEnd } = ownTurnSlotsByOwner();
-      const result = new Map();
-      for (const [id, list] of byOwner) {
-        list.sort((a, b) => a.start - b.start);
-        let sum = 0, count = 0;
-        for (let i = 0; i < list.length - 1; i++) {
-          const gap = list[i + 1].start - list[i].end;
-          if (gap > 0) { sum += gap; count += 1; }
-        }
-        const wrap = (list[0].start - spanStart) + (spanEnd - list[list.length - 1].end);
-        if (wrap > 0) { sum += wrap; count += 1; }
-        result.set(id, { avgMs: count ? sum / count : 0, count });
-      }
-      return result;
-    }
-
-    // Fences each player's own timeline into one window per turn, the same
-    // way a "round" was defined for them from the start: a turn's window
-    // runs from the end of their PREVIOUS turn (or the session start, for
-    // their first) through the end of THIS turn - so anything credited to
-    // them out-of-turn in between (e.g. an Attack of Opportunity) belongs to
-    // the turn whose window it fell in, not floating outside every turn.
-    // The last turn has no "next" turn to hand off to, so its window keeps
-    // absorbing time through the end of the session instead of stopping at
-    // its own turn's end - trailing activity still counts toward the turn
-    // that precedes it. Because these windows partition the player's
-    // entire credited timeline with no gaps or overlaps, the sum across all
-    // of them is always exactly perCombatantStats()'s totalMs for that
-    // player - so the average this returns can never disagree with the
-    // total shown next to it, unlike a plain inTurnMs/turnCount average.
-    function turnWindowStats() {
-      const { byOwner, spanStart, spanEnd } = ownTurnSlotsByOwner();
-      const lastLiveOwner = lastLiveOwnerByCombatant();
-      const segs = allSegments();
-
-      const result = new Map();
-      for (const [owner, list] of byOwner) {
-        list.sort((a, b) => a.start - b.start);
-        const windows = list.map((slot, i) => ({
-          turnIndex: i + 1,
-          start: i === 0 ? spanStart : list[i - 1].end,
-          end: i === list.length - 1 ? spanEnd : slot.end,
-          ms: 0,
-        }));
-        for (const seg of segs) {
-          if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg)) continue;
-          if (effectiveOwner(seg, lastLiveOwner) !== owner) continue;
-          // Half-open [start, end) windows chained end-to-end - every
-          // credited segment's start falls in exactly one, except a
-          // zero-duration edge case at the very last boundary, which the
-          // fallback folds into the last window rather than dropping.
-          const w = windows.find((win) => seg.start >= win.start && seg.start < win.end) ?? windows[windows.length - 1];
-          w.ms += segMs(seg);
-        }
-        const totalMs = windows.reduce((sum, w) => sum + w.ms, 0);
-        result.set(owner, { windows, avgMs: windows.length ? totalMs / windows.length : 0 });
-      }
-      return result;
-    }
-
-    // Wait = session span minus a player's own active time (in-turn +
-    // out-of-turn combined - both mean "not idle"). "setup" segments are
-    // excluded from active time but stay inside the span, so they read as
-    // wait time for every player. "team" segments are cut out of the span
-    // itself, so shared/group time is invisible to individual wait entirely
-    // (it only shows up via the GM/Team category totals).
-    function absoluteWaitStats() {
-      let spanStart = null, spanEnd = null, teamMs = 0, ignoredMs = 0;
-      for (const seg of allSegments()) {
-        if (!hasCombatContext(seg)) continue;
-        const end = seg.end ?? Date.now();
-        if (spanStart === null || seg.start < spanStart) spanStart = seg.start;
-        if (spanEnd === null || end > spanEnd) spanEnd = end;
-        if (seg.category === "team") teamMs += segMs(seg);
-        if (seg.category === "ignore") ignoredMs += segMs(seg);
-      }
-      if (spanStart === null) return new Map();
-      const span = Math.max(0, (spanEnd - spanStart) - teamMs - ignoredMs);
-
-      const lastLiveOwner = lastLiveOwnerByCombatant();
-      const activeMs = new Map();
-      for (const seg of allSegments()) {
-        if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg)) continue;
-        const owner = effectiveOwner(seg, lastLiveOwner);
-        if (!owner) continue;
-        activeMs.set(owner, (activeMs.get(owner) ?? 0) + segMs(seg));
-      }
-      const result = new Map();
-      for (const [id, active] of activeMs) result.set(id, Math.max(0, span - active));
-      return result;
-    }
-
-    // Wall-clock span of the whole session: first segment start to last
-    // segment end (or now, if still running) - "how long did this take overall".
-    function sessionTotalMs() {
-      const segs = allSegments();
-      if (!segs.length) return 0;
-      const start = Math.min(...segs.map((s) => s.start));
-      const end = Math.max(...segs.map((s) => s.end ?? Date.now()));
-      // Excluding an "ignore" segment from the min/max above wouldn't shrink
-      // the span by itself - segments before and after it still anchor the
-      // same start/end. Its duration has to be explicitly subtracted instead.
-      const ignoredMs = segs.filter((s) => s.category === "ignore").reduce((sum, s) => sum + segMs(s), 0);
-      return Math.max(0, (end - start) - ignoredMs);
     }
 
     // ---- Dummy data (only if the current session is empty) ----
@@ -1131,66 +1208,6 @@
       liveDirty = true;
       persist();
       toast("Dummy data loaded.");
-    }
-
-    // Shared by gmTotalStats() and gmRoundStats(): does this segment's time
-    // belong to the GM at all - either an unclaimed monster's own turn (the
-    // indirect path) or anything explicitly recategorized to "gm" (the
-    // direct path, e.g. a player's turn or a pause that was really the GM's
-    // time). A GM-direct segment has no combatant by nature - hasCombatContext()
-    // only gates the indirect (unclaimed-monster) path.
-    function countsForGM(seg, lastLiveOwner) {
-      if (effectiveOwner(seg, lastLiveOwner) !== null) return false; // claimed (directly, or via a defeated-instant-skip redirect) -> perCombatantStats instead
-      if (seg.category === "gm") return true;
-      // The lingering "player"-category unclaimed case: a pause segment can
-      // still carry over "player" from whatever ran before it even while
-      // gmOwned (see defaultCategory()'s pause branch), and old/imported
-      // data may predate the "gm" default entirely.
-      return seg.category === "player" && hasCombatContext(seg);
-    }
-
-    // Combined GM total: monster-turn time (not reassigned away) PLUS any
-    // segment explicitly recategorized as "gm". byEntity lets buildBarsContent()
-    // render the GM bar as a stack of per-monster segments, same as a player's
-    // controlled entities. See gmRoundStats() for the GM's per-round average -
-    // unlike a player, the GM has no single "own turn" to fence an average by.
-    function gmTotalStats() {
-      const lastLiveOwner = lastLiveOwnerByCombatant();
-      const byEntity = new Map();
-      let ms = 0;
-      for (const seg of allSegments()) {
-        if (!countsForGM(seg, lastLiveOwner)) continue;
-        const segDurMs = segMs(seg);
-        ms += segDurMs;
-        if (!byEntity.has(seg.combatantId)) {
-          byEntity.set(seg.combatantId, { combatantId: seg.combatantId, name: seg.combatantName, ms: 0 });
-        }
-        byEntity.get(seg.combatantId).ms += segDurMs;
-      }
-      return { totalMs: ms, byEntity: [...byEntity.values()] };
-    }
-
-    // The GM's average "per turn" is defined per ROUND, not per individual
-    // monster turn - round 1 is "combat start through the end of round 1",
-    // round 2 is "end of round 1 through end of round 2", and so on. Unlike
-    // a player's turnWindowStats() (which has to compute window boundaries
-    // from turn-slot end times, since a player's own turns are scattered
-    // through the timeline), every segment already carries the round it was
-    // created in (see Segment in AGENTS.md) - rounds are already a
-    // contiguous, gapless partition of the whole session, so grouping by
-    // that field directly IS the fencing. A round with no GM-attributed time
-    // still counts in the denominator (a quiet round still happened), which
-    // is why this can't just reuse gmTotalStats()'s totalMs - it also needs
-    // to know how many rounds occurred at all, not only which had GM time.
-    function gmRoundStats() {
-      const lastLiveOwner = lastLiveOwnerByCombatant();
-      const rounds = new Set();
-      let ms = 0;
-      for (const seg of allSegments()) {
-        if (seg.round != null) rounds.add(seg.round);
-        if (countsForGM(seg, lastLiveOwner)) ms += segMs(seg);
-      }
-      return { roundCount: rounds.size, avgMs: rounds.size ? ms / rounds.size : 0 };
     }
 
     // All players worth offering in the reassignment picker: currently in
@@ -1342,11 +1359,12 @@
     }
 
     function buildBarsContent() {
+      const segs = allSegments();
       // Same entry list the panel summary uses, so the two can never disagree
       // about who is in the session.
-      const entries = summaryEntries();
+      const entries = summaryEntries(segs);
       const max = Math.max(1, ...entries.map((e) => e.totalMs));
-      const sessionMs = sessionTotalMs();
+      const sessionMs = sessionTotalMs(segs);
       // Player averages come from turnWindowStats() - it fences each
       // player's own out-of-turn credit into the turn-cycle it fell in, so
       // the average always multiplies back out to exactly their total. The
@@ -1355,8 +1373,8 @@
       // end of round 1", "end of round 1 through end of round 2", etc. is
       // the unit that makes sense there. Both are exact partitions of the
       // relevant total, so neither ever needs an "in-turn only" caveat.
-      const turnWindows = turnWindowStats();
-      const gmRounds = gmRoundStats();
+      const turnWindows = turnWindowStats(segs);
+      const gmRounds = gmRoundStats(segs);
       let anyIndicator = false;
 
       const bars = entries.map((e) => {
@@ -1414,16 +1432,17 @@
 
       return wrapCard({
         title: "⚔️ Combat Times",
-        subtitle: `Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}`,
+        subtitle: `Total ${formatDuration(Math.round(sessionMs / 1000))}`,
         body: bars + legend,
       });
     }
 
     function buildPlayerListContent() {
-      const gaps = betweenTurnStats();
-      const waits = absoluteWaitStats();
-      const turnWindows = turnWindowStats();
-      const rows = perCombatantStats()
+      const segs = allSegments();
+      const gaps = betweenTurnStats(segs);
+      const waits = absoluteWaitStats(segs);
+      const turnWindows = turnWindowStats(segs);
+      const rows = perCombatantStats(segs)
         .sort((a, b) => b.totalMs - a.totalMs)
         .map((e) => {
           const tw = turnWindows.get(e.id);
@@ -1452,7 +1471,7 @@
 
       return wrapCard({
         title: "🧑 Player Overview",
-        subtitle: `Total ${formatDuration(Math.round(sessionTotalMs() / 1000))}`,
+        subtitle: `Total ${formatDuration(Math.round(sessionTotalMs(segs) / 1000))}`,
         body: rows + legend,
       });
     }
@@ -2219,7 +2238,7 @@
 
     function renderLive() {
       const el = panel.querySelector("#ctp-live");
-      const sessionMs = sessionTotalMs();
+      const sessionMs = sessionTotalMs(allSegments());
       const totalLine = `<span>${formatDuration(Math.round(sessionMs / 1000))} total</span>`;
 
       if (selectedSession !== "current") {
@@ -2278,10 +2297,10 @@
     // GM bucket, and the Team/Setup categories when they have any time at all.
     // Shared by the panel summary and the chat bar chart so the two can never
     // disagree about who is in the session.
-    function summaryEntries() {
-      const entries = perCombatantStats().map((e) => ({ ...e, icon: "🧑", kind: "player" }));
-      const gm = gmTotalStats();
-      const cat = categoryTotals();
+    function summaryEntries(segs) {
+      const entries = perCombatantStats(segs).map((e) => ({ ...e, icon: "🧑", kind: "player" }));
+      const gm = gmTotalStats(segs);
+      const cat = categoryTotals(segs);
       if (gm.totalMs > 0) {
         // No turnCount/inTurnMs here - buildBarsContent() gets the GM's
         // per-round average from gmRoundStats() instead, since the GM has
@@ -2304,7 +2323,8 @@
     // a title tooltip, and the expanded state is the labelled view.
     function renderSummary() {
       const el = panel.querySelector("#ctp-summary");
-      const entries = summaryEntries();
+      const segs = allSegments();
+      const entries = summaryEntries(segs);
       if (!entries.length) {
         el.innerHTML = `<div style="font-size:11px; opacity:0.5;">No tracked time yet.</div>`;
         return;
@@ -2314,7 +2334,7 @@
       // combatant, e.g. pre-combat setup) isn't in any entry, so without this
       // it would silently vanish from the strip instead of showing as "Other".
       const entriesMs = entries.reduce((sum, e) => sum + e.totalMs, 0);
-      const sessionMs = sessionTotalMs();
+      const sessionMs = sessionTotalMs(segs);
       const total = Math.max(sessionMs, entriesMs) || 1;
       const leftoverMs = Math.max(0, sessionMs - entriesMs);
       const strip = entries.map((e) => `
@@ -2339,7 +2359,7 @@
         // time (that combination is a deliberate, closed decision - see
         // gmTotalStats()). This is the only place that isolates just the
         // creatures' own share of it, only computed when actually shown.
-        const npc = npcAggregate();
+        const npc = npcAggregate(segs);
         const npcLine = npc.turns
           ? `<div style="margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.08); font-size:10px; opacity:0.6;">
                👹 Monsters: ${formatDuration(npc.totalS)} · Ø ${formatDuration(npc.avgS)}/turn
@@ -2910,6 +2930,9 @@
       isRealTurn, isTurnStart, segMs, defaultCategory,
       MAX_BAR_ENTITIES, orderAndShade, capEntities, mergeAlienEntities,
       gaussianRandom, randomGaussianDurationMs,
+      lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
+      buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
+      absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
     };
   }
 })();
