@@ -1483,6 +1483,18 @@
           toast("That file isn't Combat Timer session data.");
           return;
         }
+        // Not a full schema check (this script only supports data it wrote
+        // itself - see below) - just enough to reject a hand-edited or
+        // cross-version file cleanly instead of it silently breaking reports
+        // (a non-string id defeats findSegment()'s lookup, a non-numeric
+        // start produces "NaNs" durations) or, worse, a null/non-object
+        // element throwing inside the per-second render loop the next time
+        // isTurnStart() reads seg.trigger off it.
+        const isValidSegment = (s) => s && typeof s === "object" && typeof s.id === "string" && typeof s.start === "number";
+        if (parsed.segments.some((s) => !isValidSegment(s)) || (parsed.currentSegment != null && !isValidSegment(parsed.currentSegment))) {
+          toast("That file has malformed segment data - import cancelled.");
+          return;
+        }
         // Imported data is assumed to already be in the current segment
         // shape (this script only supports data it wrote itself) - no
         // backfilling for fields from an older script version.
