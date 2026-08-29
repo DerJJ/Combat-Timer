@@ -63,6 +63,13 @@
     function storageKey() {
       return `ctp-state-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
+    // sessionHistory lives under its own key, separate from the live session -
+    // it only changes on archive/delete/import-into-an-archived-tab, so a live
+    // turn/pause/reassignment write no longer has to re-serialize and rewrite
+    // the archived combats along with it.
+    function historyStorageKey() {
+      return `ctp-state-history-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
+    }
     // Throttled so a persistently-failing persist() (e.g. quota permanently
     // exceeded) surfaces once rather than spamming a toast every render tick.
     let lastStorageErrorToastAt = 0;
@@ -82,15 +89,35 @@
         return null;
       }
     }
-    function persist() {
-      if (!dirty) return; // nothing changed since the last successful write
+    function loadPersistedHistory() {
       try {
-        localStorage.setItem(storageKey(), JSON.stringify({ v: 1, segments, currentSegment, sessionHistory }));
-        dirty = false;
+        return JSON.parse(localStorage.getItem(historyStorageKey()) ?? "null");
       } catch (e) {
-        console.warn("Combat Timer: could not save state", e);
-        notifyStorageError("Could not save combat-timer data - check browser storage.");
-        // dirty stays true so the next tick retries the write
+        console.warn("Combat Timer: could not load saved session history", e);
+        loadFailed = true;
+        return null;
+      }
+    }
+    function persist() {
+      if (liveDirty) {
+        try {
+          localStorage.setItem(storageKey(), JSON.stringify({ v: 1, segments, currentSegment }));
+          liveDirty = false;
+        } catch (e) {
+          console.warn("Combat Timer: could not save state", e);
+          notifyStorageError("Could not save combat-timer data - check browser storage.");
+          // liveDirty stays true so the next tick retries the write
+        }
+      }
+      if (historyDirty) {
+        try {
+          localStorage.setItem(historyStorageKey(), JSON.stringify({ v: 1, sessionHistory }));
+          historyDirty = false;
+        } catch (e) {
+          console.warn("Combat Timer: could not save session history", e);
+          notifyStorageError("Could not save combat-timer history - check browser storage.");
+          // historyDirty stays true so the next tick retries the write
+        }
       }
     }
 
@@ -98,14 +125,24 @@
     let currentSegment = null;  // current session: the running segment
     let sessionHistory = [];    // ring buffer: last 2 finished sessions, newest first
     let panelVisible = true;
-    let loadFailed = false;     // set by loadPersisted() on error; toasted once buildPanel() exists
-    let dirty = false;          // set at every real mutation of segments/currentSegment/sessionHistory; persist() no-ops without it
+    let loadFailed = false;     // set by loadPersisted()/loadPersistedHistory() on error; toasted once buildPanel() exists
+    let liveDirty = false;      // set at every real mutation of segments/currentSegment; persist() skips that key without it
+    let historyDirty = false;   // set at every real mutation of sessionHistory; persist() skips that key without it
 
     const saved = loadPersisted();
     if (saved) {
       segments = saved.segments ?? [];
       currentSegment = saved.currentSegment ?? null;
-      sessionHistory = saved.sessionHistory ?? [];
+    }
+    const savedHistory = loadPersistedHistory();
+    if (savedHistory) {
+      sessionHistory = savedHistory.sessionHistory ?? [];
+    } else if (saved && Array.isArray(saved.sessionHistory)) {
+      // One-time migration: sessionHistory used to live in the combined
+      // blob above. Adopt it here and let the next persist() write it into
+      // its own key; the old key stops carrying it on its next write.
+      sessionHistory = saved.sessionHistory;
+      historyDirty = true;
     }
 
     function uid() {
@@ -177,7 +214,7 @@
 
     function closeSegment() {
       if (!currentSegment) return;
-      dirty = true;
+      liveDirty = true;
       currentSegment.end = currentSegment.end ?? Date.now();
       const prev = segments[segments.length - 1] ?? null;
       if (currentSegment.trigger === "pause" && prev && segMs(currentSegment) < SHORT_PAUSE_MERGE_THRESHOLD_MS) {
@@ -217,7 +254,7 @@
     }
 
     function openSegment(trigger, combatant, combat = null) {
-      dirty = true;
+      liveDirty = true;
       const prev = segments[segments.length - 1] ?? null;
       const ownerId = getOwningPlayerId(combatant?.actor);
       currentSegment = makeSegment({
@@ -291,11 +328,12 @@
     function archiveSessionIfNeeded() {
       closeSegment();
       if (!segments.length) return;
-      dirty = true;
+      historyDirty = true;
       sessionHistory.unshift({ segments, endedAt: Date.now() });
       sessionHistory = sessionHistory.slice(0, 2);
       segments = [];
       currentSegment = null;
+      liveDirty = true; // segments/currentSegment just reset to empty
       selectedSession = "current"; // focus the new session
       // Same reset a manual tab switch already does (see renderTabs()) - a
       // fresh session's segments get fresh ids so there's no collision risk
@@ -339,7 +377,7 @@
       // segment is marked defeated (excluded from every aggregate) before
       // reconcileWithLiveState() closes it out and picks up whatever's next.
       if (currentSegment?.combatantId === combatant.id) {
-        dirty = true;
+        liveDirty = true;
         currentSegment.defeated = true;
         reconcileWithLiveState();
       }
@@ -372,7 +410,7 @@
         for (const seg of liveSegs) {
           if (seg.combatantId === c.id && seg.combatantName !== liveName) {
             seg.combatantName = liveName;
-            dirty = true;
+            liveDirty = true;
           }
         }
       }
@@ -402,6 +440,13 @@
     }
     function findSegment(id) {
       return allSegments().find((s) => s.id === id) ?? null;
+    }
+    // A segment mutated in place (category/owner reassignment) belongs to
+    // whichever storage key the currently viewed session lives in - findSegment()
+    // can resolve to an archived session's segment just as easily as a live one.
+    function markSelectedSessionDirty() {
+      if (selectedSession === "current") liveDirty = true;
+      else historyDirty = true;
     }
 
     // Single source of truth for "does this segment have real combat context
@@ -819,7 +864,7 @@
       }
       segments = generateDummySegments();
       currentSegment = null;
-      dirty = true;
+      liveDirty = true;
       persist();
       toast("Dummy data loaded.");
     }
@@ -1250,7 +1295,7 @@
       confirmBar("Delete this archived session? No undo.", "Delete", () => {
         sessionHistory.splice(idx, 1);
         selectedSession = "current";
-        dirty = true;
+        historyDirty = true;
         persist();
         toast("Archived session deleted.");
         renderPanel();
@@ -1319,12 +1364,13 @@
           if (selectedSession === "current") {
             segments = importedSegments;
             currentSegment = importedCurrent;
+            liveDirty = true;
             reconcileWithLiveState(); // imported data may not match what's actually live right now
           } else {
             const idx = selectedSession === "prev1" ? 0 : 1;
             sessionHistory[idx] = { segments: importedSegments, endedAt: parsed.endedAt ?? Date.now() };
+            historyDirty = true;
           }
-          dirty = true;
           persist();
           renderPanel();
           toast(`Imported into “${label}”.`, "Undo", () => undoImport());
@@ -1341,14 +1387,15 @@
       if (importUndo.session === "current") {
         segments = importUndo.segments;
         currentSegment = importUndo.currentSegment;
+        liveDirty = true;
         reconcileWithLiveState();
       } else {
         const idx = importUndo.session === "prev1" ? 0 : 1;
         if (importUndo.entry) sessionHistory[idx] = importUndo.entry;
         else sessionHistory.splice(idx, 1);
+        historyDirty = true;
       }
       importUndo = null;
-      dirty = true;
       persist();
       toast("Import undone.");
       renderPanel();
@@ -2495,7 +2542,7 @@
           seg.overrideOwnerId = null;
           playerPickerSegId = null;
           openCatSegId = null;
-          dirty = true;
+          markSelectedSessionDirty();
           persist();
           toast(`Marked as ${CATEGORY_META[cat].label}.`);
           renderPanel();
@@ -2511,7 +2558,7 @@
           seg.overrideOwnerId = pick === "__default__" ? null : pick;
           playerPickerSegId = null;
           openCatSegId = null;
-          dirty = true;
+          markSelectedSessionDirty();
           persist();
           toast(pick === "__default__" ? "Back to the default owner." : `Reassigned to ${ownerName(pick)}.`);
           renderPanel();
