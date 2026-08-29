@@ -21,6 +21,241 @@
 (function () {
   'use strict';
 
+  // ---- Pure helpers ---------------------------------------------------------
+  // Stateless functions with no dependency on Foundry globals (game/Hooks/
+  // document) or on init()'s closure state below - kept at this outer scope
+  // specifically so the module.exports guard at the end of this file can
+  // reach them. init() still closes over them exactly the way it always did
+  // (lexical scoping doesn't care how many levels shallower they live), so
+  // moving them here changes nothing about how the panel behaves - it only
+  // makes them reachable by `node --test` against this exact file, with no
+  // build step and no second copy to drift out of sync. See the bottom of
+  // this file for what's actually exported.
+
+  function formatDuration(totalSeconds) {
+    const s = Math.max(0, Math.round(totalSeconds));
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return m > 0 ? `${m}m${String(sec).padStart(2, "0")}s` : `${sec}s`;
+  }
+  // 24h regardless of locale: the column is ~40px wide and a locale that
+  // renders "09:30 PM" pushes the name column into an ellipsis.
+  function formatClock(ts) {
+    const d = new Date(ts);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  }
+  // Archived sessions are labeled by when the combat STARTED (not ended) -
+  // includes the date since, unlike formatClock()'s HH:MM, this has to stay
+  // unambiguous across a list that can span weeks or months.
+  function formatArchiveLabel(ts) {
+    const d = new Date(ts);
+    return `${d.toLocaleString(undefined, { month: "short" })} ${d.getDate()}, ${formatClock(ts)}`;
+  }
+  // Every name interpolated into innerHTML/ChatMessage content goes through
+  // this first - names come from token/actor/user names, which anyone with
+  // rename permission controls, and chat content can be seen by other
+  // clients after "Reveal to Everyone".
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // Shared by darkenHex() and relLuminance() - parses "#rrggbb" (or
+  // "rrggbb") into [r, g, b] ints, or null if it doesn't match.
+  function parseHexRgb(hex) {
+    const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex ?? "");
+    return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
+  }
+  // Scales each RGB channel by `factor` (1 = unchanged, <1 = darker).
+  // Computed as real hex values rather than a CSS filter, since a filter is
+  // easier for an aggressive Foundry/system theme to override, and hard
+  // constraint #2 wants every color fully inline and self-contained.
+  function darkenHex(hex, factor) {
+    const rgb = parseHexRgb(hex);
+    if (!rgb) return hex;
+    const scale = (c) => Math.round(c * factor).toString(16).padStart(2, "0");
+    return `#${rgb.map(scale).join("")}`;
+  }
+  // WCAG relative luminance, used to decide whether a label drawn ON a fill
+  // should be dark or light. The bar segments are shaded down to 45% of the
+  // base color, so a single hardcoded label color is unreadable on roughly
+  // half of them.
+  function relLuminance(hex) {
+    const rgb = parseHexRgb(hex);
+    if (!rgb) return 0.5;
+    const lin = rgb.map((c8) => {
+      const c = c8 / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+  }
+  function labelColorOn(hex) {
+    return relLuminance(hex) > 0.3 ? "rgba(0,0,0,0.62)" : "rgba(255,255,255,0.85)";
+  }
+  // Deterministic fallback color for an owner id that doesn't resolve to a
+  // real, currently-known Foundry user - a synthetic dummy-data id, or a
+  // real id from an imported session that isn't in this world's roster.
+  // Hashing the id itself keeps the color stable across renders and reloads
+  // with no state to persist.
+  function hashToHex(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) | 0;
+    const hue = Math.abs(hash) % 360;
+    return hslToHex(hue, 55, 55);
+  }
+  function hslToHex(h, s, l) {
+    s /= 100; l /= 100;
+    const k = (n) => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    const toHex = (n) => Math.round(f(n) * 255).toString(16).padStart(2, "0");
+    return `#${toHex(0)}${toHex(8)}${toHex(4)}`;
+  }
+  function pct(part, whole) {
+    return whole > 0 ? Math.round((part / whole) * 100) : 0;
+  }
+
+  // dnd5e/pf2e-specific: the Actor "type" value that means "a real player
+  // character", as opposed to an NPC/summon - ownership alone can't tell
+  // them apart, since a player-owned summon still has an NPC-shaped actor.
+  const PC_ACTOR_TYPE = "character";
+  function isPcActorType(actorType) {
+    return actorType === PC_ACTOR_TYPE;
+  }
+  // Single source of truth for "does this segment have real combat context
+  // at all" - used by every aggregate in init() below.
+  function hasCombatContext(seg) {
+    return !!seg.combatantId;
+  }
+  function resolvedOwner(seg) {
+    return seg.overrideOwnerId ?? seg.ownerId ?? null;
+  }
+  function isPlayerControlled(seg) {
+    return resolvedOwner(seg) !== null;
+  }
+  // A defeated PC still gets a real turn (death saves etc. are genuine
+  // activity); a defeated NPC's turn is an instant skip - nobody actually
+  // decided anything, so it never counts as "a turn" for averaging,
+  // regardless of who its time ends up credited to (see effectiveOwner()).
+  function isRealTurn(seg) {
+    return hasCombatContext(seg) && (!seg.defeated || isPcActorType(seg.actorType));
+  }
+  function isTurnStart(seg) {
+    return seg.trigger === "turn" || seg.trigger === "resume";
+  }
+  function segMs(seg) {
+    return (seg.end ?? Date.now()) - seg.start;
+  }
+
+  const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one
+  // Setup is a GM-only category (see CATEGORY_META in init()) - a segment
+  // with a player owner can never default to, or inherit, "setup".
+  function defaultCategory(trigger, prevSegment, ownerId) {
+    if (trigger === "pause") {
+      const gmOwned = !ownerId;
+      const prevDur = prevSegment ? segMs(prevSegment) : Infinity;
+      if (gmOwned && prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
+      // "ignore" is manual-only - a live pause is real time and must never
+      // silently inherit it from the segment before.
+      if (prevSegment && prevSegment.category !== "ignore" && (gmOwned || prevSegment.category !== "setup")) {
+        return prevSegment.category;
+      }
+      return gmOwned ? "setup" : "player";
+    }
+    // A genuinely unowned combatant's own turn is the GM's by default - not
+    // "player" - so the category chip reads correctly the moment a
+    // monster's turn starts (see effectiveOwner()/countsForGM() in init()).
+    return ownerId ? "player" : "gm";
+  }
+
+  const MAX_BAR_ENTITIES = 4; // per-entity stack cap in the chat bar chart
+  // Orders a list of per-entity items so the "primary" one (a player's own
+  // PC, found via isPrimary) ends up last/rightmost in full color, with
+  // every other entity trailing to its left in progressively darker shades
+  // of the same base color, in their original (turn-order) sequence. With
+  // no primary match (e.g. the GM's monsters), the last item in original
+  // order anchors instead, so "rightmost = brightest" holds everywhere.
+  function orderAndShade(items, isPrimary) {
+    if (!items.length) return [];
+    const primaryIdx = items.findIndex(isPrimary);
+    const primary = primaryIdx >= 0 ? items[primaryIdx] : items[items.length - 1];
+    const ordered = [...items.filter((it) => it !== primary), primary];
+    const minShade = 0.45;
+    return ordered.map((item, i) => ({
+      item,
+      shade: ordered.length <= 1 ? 1 : minShade + (1 - minShade) * (i / (ordered.length - 1)),
+    }));
+  }
+  // Caps how many entities a single bar splits into. orderAndShade() spreads
+  // shades from 0.45 to 1.0 across however many items it gets - past four or
+  // five, neighbouring shades differ by so little that the bar reads as one
+  // smear, and minLabelPct suppresses most of the labels anyway. Everything
+  // past the cap is merged into a single "+N more" item placed first, so it
+  // takes the darkest shade at the far left and the named entities keep the
+  // bright end. Sums every numeric field the two callers use.
+  function capEntities(items, valueOf, isPrimary, max = MAX_BAR_ENTITIES) {
+    if (items.length <= max) return items;
+    const primaryIdx = items.findIndex(isPrimary);
+    const primary = primaryIdx >= 0 ? items[primaryIdx] : items[items.length - 1];
+    const others = items.filter((it) => it !== primary);
+    const ranked = [...others].sort((a, b) => valueOf(b) - valueOf(a));
+    // max - 2, not max - 1: the merged "+N more" item occupies one of the
+    // slices too, and the primary always keeps its own.
+    const keep = new Set(ranked.slice(0, Math.max(0, max - 2)));
+    const merged = ranked.slice(Math.max(0, max - 2));
+    const sum = (field) => merged.reduce((total, it) => total + (it[field] ?? 0), 0);
+    const mergedItem = {
+      combatantId: "__more__",
+      name: `+${merged.length} more`,
+      mergedNames: merged.map((it) => it.name), // for the merged slice's tooltip
+      actorType: null,
+      ms: sum("ms"),
+      inTurnMs: sum("inTurnMs"),
+      outOfTurnMs: sum("outOfTurnMs"),
+      pausedMs: sum("pausedMs"),
+      turnCount: sum("turnCount"),
+    };
+    // Kept entities stay in their original (turn-order) sequence.
+    return [mergedItem, ...items.filter((it) => it === primary || keep.has(it))];
+  }
+  // An entity with no inTurnMs of its own under this owner never had a
+  // genuine designated turn - it's only present because some of its time
+  // was redirected here (e.g. an Attack of Opportunity) - so it gets folded
+  // into the primary entity instead of standing out as its own shaded
+  // segment. If NO entity has any inTurnMs, nothing is merged - there's no
+  // genuine "owner entity" to fold into.
+  function mergeAlienEntities(byEntity, isPrimary) {
+    if (!byEntity.some((en) => en.inTurnMs > 0)) return byEntity;
+    const primaryIdx = byEntity.findIndex(isPrimary);
+    const primary = primaryIdx >= 0 ? byEntity[primaryIdx] : byEntity.find((en) => en.inTurnMs > 0);
+    const merged = { ...primary };
+    for (const en of byEntity) {
+      if (en === primary || en.inTurnMs > 0) continue;
+      merged.outOfTurnMs += en.outOfTurnMs;
+      merged.pausedMs += en.pausedMs;
+      merged.turnCount += en.turnCount;
+    }
+    return byEntity.filter((en) => en === primary || en.inTurnMs > 0).map((en) => en === primary ? merged : en);
+  }
+
+  // Standard normal via Box-Muller, then rescaled to (mean, stdDev).
+  function gaussianRandom(mean, stdDev) {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random(); // avoid log(0)
+    while (v === 0) v = Math.random();
+    const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    return mean + z * stdDev;
+  }
+  // Gaussian duration within [minMs, maxMs]: mean at the range's center,
+  // stdDev = range/6 so ~99.7% of draws land inside on their own; clamped
+  // at the edges to catch the rare outlier from the Box-Muller tail.
+  function randomGaussianDurationMs(minMs, maxMs) {
+    const mean = (minMs + maxMs) / 2;
+    const stdDev = (maxMs - minMs) / 6;
+    const val = gaussianRandom(mean, stdDev);
+    return Math.round(Math.min(maxMs, Math.max(minMs, val)));
+  }
+
   function waitForFoundryReady(cb) {
     function attach() {
       if (window.game?.ready) return cb();
@@ -35,7 +270,14 @@
     }, 200);
   }
 
-  waitForFoundryReady(init);
+  // Guarded so this file can also be `require()`'d under Node (see the
+  // module.exports block at the end) without trying to touch a `window`
+  // that doesn't exist there - this is the only line whose behavior differs
+  // between the two environments, and only in that it does nothing at all
+  // outside a browser.
+  if (typeof window !== "undefined") {
+    waitForFoundryReady(init);
+  }
 
   function init() {
     // Each category carries its own chip colors so a glance down the segment
@@ -251,52 +493,13 @@
     // renders and reloads with no state to persist, and two different
     // unresolvable ids reliably land on two different colors instead of
     // every one of them collapsing onto the same flat grey.
-    function hashToHex(str) {
-      let hash = 0;
-      for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) | 0;
-      const hue = Math.abs(hash) % 360;
-      return hslToHex(hue, 55, 55);
-    }
-    function hslToHex(h, s, l) {
-      s /= 100; l /= 100;
-      const k = (n) => (n + h / 30) % 12;
-      const a = s * Math.min(l, 1 - l);
-      const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
-      const toHex = (n) => Math.round(f(n) * 255).toString(16).padStart(2, "0");
-      return `#${toHex(0)}${toHex(8)}${toHex(4)}`;
-    }
-
     function getCombatantColor(ownerId) {
       if (ownerId) return game.users.get(ownerId)?.color.css ?? hashToHex(ownerId);
       const gm = game.users.find((u) => u.isGM && u.active) ?? game.users.find((u) => u.isGM);
       return gm ? gm.color.css : "#c0392b";
     }
 
-    const SETUP_PAUSE_THRESHOLD_MS = 5000; // a pause right after a short prior segment is likely a round-boundary pause, not a mid-decision one
     const SHORT_PAUSE_MERGE_THRESHOLD_MS = 3000; // a pause shorter than this is noise (toggle lag, a misclick) - fold it into whatever ran right before instead of showing it as its own segment
-
-    // Setup is a GM-only category (see CATEGORY_META) - a segment with a
-    // player owner can never default to, or inherit, "setup".
-    function defaultCategory(trigger, prevSegment, ownerId) {
-      if (trigger === "pause") {
-        const gmOwned = !ownerId;
-        const prevDur = prevSegment ? segMs(prevSegment) : Infinity;
-        if (gmOwned && prevDur < SETUP_PAUSE_THRESHOLD_MS) return "setup";
-        // "ignore" is manual-only (see CATEGORY_META) - a live pause is real
-        // time and must never silently inherit it from the segment before.
-        if (prevSegment && prevSegment.category !== "ignore" && (gmOwned || prevSegment.category !== "setup")) {
-          return prevSegment.category;
-        }
-        return gmOwned ? "setup" : "player";
-      }
-      // A genuinely unowned combatant's own turn is the GM's by default -
-      // not "player" - so the category chip reads correctly the moment a
-      // monster's turn starts, instead of only becoming true GM time
-      // indirectly through the stats functions (see effectiveOwner()/
-      // countsForGM() for how a manual "gm" recategorization, or a defeated
-      // combatant's redirect, still resolve correctly on top of this).
-      return ownerId ? "player" : "gm";
-    }
 
     function closeSegment() {
       if (!currentSegment) return;
@@ -549,23 +752,6 @@
       const { segs, current } = getSelectedSessionData();
       return current ? [...segs, current] : segs;
     }
-    function segMs(seg) {
-      return (seg.end ?? Date.now()) - seg.start;
-    }
-    function formatDuration(totalSeconds) {
-      const s = Math.max(0, Math.round(totalSeconds));
-      const m = Math.floor(s / 60);
-      const sec = s % 60;
-      return m > 0 ? `${m}m${String(sec).padStart(2, "0")}s` : `${sec}s`;
-    }
-    // Every name interpolated into innerHTML/ChatMessage content goes through
-    // this first - names come from token/actor/user names, which anyone with
-    // rename permission controls, and chat content can be seen by other
-    // clients after "Reveal to Everyone".
-    function escapeHtml(s) {
-      return String(s ?? "").replace(/[&<>"']/g, (c) =>
-        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-    }
     function findSegment(id) {
       return allSegments().find((s) => s.id === id) ?? null;
     }
@@ -577,35 +763,6 @@
       else archiveDirty = true;
     }
 
-    // Single source of truth for "does this segment have real combat context
-    // at all" - used by every aggregate below (see AGENTS.md).
-    function hasCombatContext(seg) {
-      return !!seg.combatantId;
-    }
-    function resolvedOwner(seg) {
-      return seg.overrideOwnerId ?? seg.ownerId ?? null;
-    }
-    function isPlayerControlled(seg) {
-      return resolvedOwner(seg) !== null;
-    }
-    // dnd5e/pf2e-specific: the Actor "type" value that means "a real player
-    // character", as opposed to an NPC/summon - ownership alone can't tell
-    // them apart, since a player-owned summon still has an NPC-shaped actor.
-    // Not generalized to other systems (this script doesn't support any),
-    // but kept as one place to extend if that ever changes, instead of the
-    // same literal string duplicated at every call site that cares.
-    const PC_ACTOR_TYPE = "character";
-    function isPcActorType(actorType) {
-      return actorType === PC_ACTOR_TYPE;
-    }
-
-    // A defeated PC still gets a real turn (death saves etc. are genuine
-    // activity); a defeated NPC's turn is an instant skip - nobody actually
-    // decided anything, so it never counts as "a turn" for averaging,
-    // regardless of who its time ends up credited to (see effectiveOwner()).
-    function isRealTurn(seg) {
-      return hasCombatContext(seg) && (!seg.defeated || isPcActorType(seg.actorType));
-    }
     // For each combatantId, who resolvedOwner() credited its most recent real
     // (non-instant-skip) turn to. Recomputed fresh every time - not cached -
     // so it always reflects the latest known ownership, including a manual
@@ -744,9 +901,6 @@
     // trailing segments after the last trigger stay in the last slot.
     // designatedOwner is the TECHNICAL (non-overridden) owner of whoever's
     // turn this structurally was - it never changes due to reassignment.
-    function isTurnStart(seg) {
-      return seg.trigger === "turn" || seg.trigger === "resume";
-    }
     function buildTurnSlots() {
       const slots = [];
       let afterIgnored = false;
@@ -898,24 +1052,6 @@
 
     // ---- Dummy data (only if the current session is empty) ----
 
-    // Standard normal via Box-Muller, then rescaled to (mean, stdDev).
-    function gaussianRandom(mean, stdDev) {
-      let u = 0, v = 0;
-      while (u === 0) u = Math.random(); // avoid log(0)
-      while (v === 0) v = Math.random();
-      const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-      return mean + z * stdDev;
-    }
-
-    // Gaussian duration within [minMs, maxMs]: mean at the range's center,
-    // stdDev = range/6 so ~99.7% of draws land inside on their own; clamped
-    // at the edges to catch the rare outlier from the Box-Muller tail.
-    function randomGaussianDurationMs(minMs, maxMs) {
-      const mean = (minMs + maxMs) / 2;
-      const stdDev = (maxMs - minMs) / 6;
-      const val = gaussianRandom(mean, stdDev);
-      return Math.round(Math.min(maxMs, Math.max(minMs, val)));
-    }
     const randomTurnDurationMs = () => randomGaussianDurationMs(30_000, 210_000);
     const randomPauseDurationMs = () => randomGaussianDurationMs(30_000, 60_000);
 
@@ -1079,75 +1215,6 @@
 
     // ---- Chat reports (always self-roll, i.e. whisper to yourself) ----
 
-    // Scales each RGB channel by `factor` (1 = unchanged, <1 = darker).
-    // Computed as real hex values rather than a CSS filter, since a filter
-    // is easier for an aggressive Foundry/system theme to override, and
-    // hard constraint #2 wants every color fully inline and self-contained.
-    // Shared by darkenHex() and relLuminance() - parses "#rrggbb" (or
-    // "rrggbb") into [r, g, b] ints, or null if it doesn't match.
-    function parseHexRgb(hex) {
-      const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex ?? "");
-      return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : null;
-    }
-
-    function darkenHex(hex, factor) {
-      const rgb = parseHexRgb(hex);
-      if (!rgb) return hex;
-      const scale = (c) => Math.round(c * factor).toString(16).padStart(2, "0");
-      return `#${rgb.map(scale).join("")}`;
-    }
-
-    // Orders a list of per-entity items so the "primary" one (a player's own
-    // PC, found via isPrimary) ends up last/rightmost in full color, with
-    // every other entity trailing to its left in progressively darker shades
-    // of the same base color, in their original (turn-order) sequence. With
-    // no primary match (e.g. the GM's monsters), the last item in original
-    // order anchors instead, so "rightmost = brightest" holds everywhere.
-    function orderAndShade(items, isPrimary) {
-      if (!items.length) return [];
-      const primaryIdx = items.findIndex(isPrimary);
-      const primary = primaryIdx >= 0 ? items[primaryIdx] : items[items.length - 1];
-      const ordered = [...items.filter((it) => it !== primary), primary];
-      const minShade = 0.45;
-      return ordered.map((item, i) => ({
-        item,
-        shade: ordered.length <= 1 ? 1 : minShade + (1 - minShade) * (i / (ordered.length - 1)),
-      }));
-    }
-
-    // Caps how many entities a single bar splits into. orderAndShade() spreads
-    // shades from 0.45 to 1.0 across however many items it gets - past four or
-    // five, neighbouring shades differ by so little that the bar reads as one
-    // smear, and minLabelPct suppresses most of the labels anyway. Everything
-    // past the cap is merged into a single "+N more" item placed first, so it
-    // takes the darkest shade at the far left and the named entities keep the
-    // bright end. Sums every numeric field the two callers use.
-    function capEntities(items, valueOf, isPrimary, max = MAX_BAR_ENTITIES) {
-      if (items.length <= max) return items;
-      const primaryIdx = items.findIndex(isPrimary);
-      const primary = primaryIdx >= 0 ? items[primaryIdx] : items[items.length - 1];
-      const others = items.filter((it) => it !== primary);
-      const ranked = [...others].sort((a, b) => valueOf(b) - valueOf(a));
-      // max - 2, not max - 1: the merged "+N more" item occupies one of the
-      // slices too, and the primary always keeps its own.
-      const keep = new Set(ranked.slice(0, Math.max(0, max - 2)));
-      const merged = ranked.slice(Math.max(0, max - 2));
-      const sum = (field) => merged.reduce((total, it) => total + (it[field] ?? 0), 0);
-      const mergedItem = {
-        combatantId: "__more__",
-        name: `+${merged.length} more`,
-        mergedNames: merged.map((it) => it.name), // for the merged slice's tooltip
-        actorType: null,
-        ms: sum("ms"),
-        inTurnMs: sum("inTurnMs"),
-        outOfTurnMs: sum("outOfTurnMs"),
-        pausedMs: sum("pausedMs"),
-        turnCount: sum("turnCount"),
-      };
-      // Kept entities stay in their original (turn-order) sequence.
-      return [mergedItem, ...items.filter((it) => it === primary || keep.has(it))];
-    }
-
     // Renders one row's worth of proportional, colored sub-segments sharing
     // a common parent width. A part's label is only drawn when its own
     // share is wide enough to plausibly fit it - a narrow sliver still
@@ -1191,20 +1258,6 @@
     // instead of getting a separate one. If NO entity has any inTurnMs (this
     // owner only ever received redirected time), there's no genuine "owner
     // entity" to fold into, so nothing is merged.
-    function mergeAlienEntities(byEntity, isPrimary) {
-      if (!byEntity.some((en) => en.inTurnMs > 0)) return byEntity;
-      const primaryIdx = byEntity.findIndex(isPrimary);
-      const primary = primaryIdx >= 0 ? byEntity[primaryIdx] : byEntity.find((en) => en.inTurnMs > 0);
-      const merged = { ...primary };
-      for (const en of byEntity) {
-        if (en === primary || en.inTurnMs > 0) continue;
-        merged.outOfTurnMs += en.outOfTurnMs;
-        merged.pausedMs += en.pausedMs;
-        merged.turnCount += en.turnCount;
-      }
-      return byEntity.filter((en) => en === primary || en.inTurnMs > 0).map((en) => en === primary ? merged : en);
-    }
-
     function buildPlayerBarRows(e) {
       const owned = mergeAlienEntities(e.byEntity, (en) => isPcActorType(en.actorType));
       const entities = capEntities(owned, (en) => en.inTurnMs + en.outOfTurnMs, (en) => isPcActorType(en.actorType));
@@ -1622,7 +1675,6 @@
     const PANEL_WIDTH_DEFAULT = 300;
     const PANEL_WIDTH_MIN = 220;
     const PANEL_WIDTH_MAX = 560;
-    const MAX_BAR_ENTITIES = 4; // per-entity stack cap in the chat bar chart
     const SEG_HEIGHT_MIN = 120;
     const SEG_HEIGHT_MAX = 700;
 
@@ -1646,35 +1698,6 @@
     let panel = null;
 
     // ---- Small shared helpers ----------------------------------------------
-    // 24h regardless of locale: the column is ~40px wide and a locale that
-    // renders "09:30 PM" pushes the name column into an ellipsis.
-    function formatClock(ts) {
-      const d = new Date(ts);
-      return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-    }
-    // Archived sessions are labeled by when the combat STARTED (not ended) -
-    // includes the date since, unlike formatClock()'s HH:MM, this has to stay
-    // unambiguous across a list that can span weeks or months.
-    function formatArchiveLabel(ts) {
-      const d = new Date(ts);
-      return `${d.toLocaleString(undefined, { month: "short" })} ${d.getDate()}, ${formatClock(ts)}`;
-    }
-    // WCAG relative luminance, used to decide whether a label drawn ON a fill
-    // should be dark or light. The bar segments are shaded down to 45% of the
-    // base color, so a single hardcoded label color is unreadable on roughly
-    // half of them.
-    function relLuminance(hex) {
-      const rgb = parseHexRgb(hex);
-      if (!rgb) return 0.5;
-      const lin = rgb.map((c8) => {
-        const c = c8 / 255;
-        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-      });
-      return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
-    }
-    function labelColorOn(hex) {
-      return relLuminance(hex) > 0.3 ? "rgba(0,0,0,0.62)" : "rgba(255,255,255,0.85)";
-    }
     // Same "unresolvable id" problem as getCombatantColor(): a
     // dummy-data id carries its own name right in the id (see
     // getDummyPlayerSource()) and is resolved back out of it here; anything
@@ -1687,9 +1710,6 @@
       const dummy = /^dummy-owner-(.+)$/.exec(id);
       if (dummy) return dummy[1];
       return `Player ${id.slice(0, 4)}`;
-    }
-    function pct(part, whole) {
-      return whole > 0 ? Math.round((part / whole) * 100) : 0;
     }
 
     // ---- Panel chrome -------------------------------------------------------
@@ -2876,5 +2896,20 @@
       archivePickerOpen = false;
       renderPanel();
     });
+  }
+
+  // No effect in Tampermonkey/the browser - `module` doesn't exist there, so
+  // this whole block is skipped. Lets `node --test` `require()` this exact
+  // file (see test/pure.test.js) without a build step or a second copy of
+  // any of these functions to drift out of sync with what actually ships.
+  if (typeof module !== "undefined") {
+    module.exports = {
+      formatDuration, formatClock, formatArchiveLabel, escapeHtml,
+      parseHexRgb, darkenHex, relLuminance, labelColorOn, hashToHex, hslToHex, pct,
+      PC_ACTOR_TYPE, isPcActorType, hasCombatContext, resolvedOwner, isPlayerControlled,
+      isRealTurn, isTurnStart, segMs, defaultCategory,
+      MAX_BAR_ENTITIES, orderAndShade, capEntities, mergeAlienEntities,
+      gaussianRandom, randomGaussianDurationMs,
+    };
   }
 })();
