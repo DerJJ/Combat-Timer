@@ -89,12 +89,16 @@
     function storageKey() {
       return `ctp-state-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
-    // sessionHistory lives under its own key, separate from the live session -
-    // it only changes on archive/delete/import-into-an-archived-tab, so a live
-    // turn/pause/reassignment write no longer has to re-serialize and rewrite
-    // the archived combats along with it.
-    function historyStorageKey() {
-      return `ctp-state-history-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
+    // Archived sessions live one-per-key, plus a small manifest holding only
+    // { id, startedAt, endedAt } for each - archiving, deleting, or importing
+    // into one archived session never has to read or rewrite any of the
+    // others, and the manifest itself stays cheap to rewrite no matter how
+    // many archived sessions exist (see ui.maxArchivedSessions).
+    function archiveManifestKey() {
+      return `ctp-state-archive-index-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
+    }
+    function archivedSessionKey(id) {
+      return `ctp-state-archive-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}-${id}`;
     }
     // Throttled so a persistently-failing persist() (e.g. quota permanently
     // exceeded) surfaces once rather than spamming a toast every render tick.
@@ -115,13 +119,36 @@
         return null;
       }
     }
-    function loadPersistedHistory() {
+    function loadArchiveManifest() {
       try {
-        return JSON.parse(localStorage.getItem(historyStorageKey()) ?? "null");
+        const raw = JSON.parse(localStorage.getItem(archiveManifestKey()) ?? "null");
+        return Array.isArray(raw?.sessions) ? raw.sessions : null;
       } catch (e) {
-        console.warn("Combat Timer: could not load saved session history", e);
+        console.warn("Combat Timer: could not load the archived-session index", e);
         loadFailed = true;
         return null;
+      }
+    }
+    function loadArchivedSessionSegments(id) {
+      try {
+        const raw = JSON.parse(localStorage.getItem(archivedSessionKey(id)) ?? "null");
+        return Array.isArray(raw?.segments) ? raw.segments : [];
+      } catch (e) {
+        console.warn("Combat Timer: could not load archived session", id, e);
+        loadFailed = true;
+        return [];
+      }
+    }
+    // Writes one archived session's data immediately, not through the dirty-
+    // flag/persist() cycle below - archiving, importing into an archived
+    // session, and undoing that import are all one-off user actions (never
+    // the per-tick renderPanel() path), so there's nothing to defer.
+    function writeArchivedSession(id, segs) {
+      try {
+        localStorage.setItem(archivedSessionKey(id), JSON.stringify({ v: 1, segments: segs }));
+      } catch (e) {
+        console.warn("Combat Timer: could not save archived session", id, e);
+        notifyStorageError("Could not save an archived session - check browser storage.");
       }
     }
     function persist() {
@@ -135,40 +162,73 @@
           // liveDirty stays true so the next tick retries the write
         }
       }
-      if (historyDirty) {
+      if (manifestDirty) {
         try {
-          localStorage.setItem(historyStorageKey(), JSON.stringify({ v: 1, sessionHistory }));
-          historyDirty = false;
+          localStorage.setItem(archiveManifestKey(), JSON.stringify({ v: 1, sessions: archiveManifest }));
+          manifestDirty = false;
         } catch (e) {
-          console.warn("Combat Timer: could not save session history", e);
-          notifyStorageError("Could not save combat-timer history - check browser storage.");
-          // historyDirty stays true so the next tick retries the write
+          console.warn("Combat Timer: could not save the archived-session index", e);
+          notifyStorageError("Could not save the archived-session list - check browser storage.");
+          // manifestDirty stays true so the next tick retries the write
         }
+      }
+      if (archiveDirty && viewedArchive) {
+        writeArchivedSession(viewedArchive.id, viewedArchive.segments);
+        archiveDirty = false;
       }
     }
 
     let segments = [];          // current session: closed segments
     let currentSegment = null;  // current session: the running segment
-    let sessionHistory = [];    // ring buffer: last 2 finished sessions, newest first
+    let archiveManifest = [];   // [{ id, startedAt, endedAt }], newest first - small, always fully in memory
+    let viewedArchive = null;   // { id, segments } - lazily loaded snapshot of whichever archived session is selected
     let panelVisible = true;
-    let loadFailed = false;     // set by loadPersisted()/loadPersistedHistory() on error; toasted once buildPanel() exists
+    let loadFailed = false;     // set on any load error; toasted once buildPanel() exists
     let liveDirty = false;      // set at every real mutation of segments/currentSegment; persist() skips that key without it
-    let historyDirty = false;   // set at every real mutation of sessionHistory; persist() skips that key without it
+    let manifestDirty = false;  // set whenever archiveManifest itself changes (archive/evict/delete/import metadata)
+    let archiveDirty = false;   // set when viewedArchive.segments is mutated in place (category/owner reassignment)
 
     const saved = loadPersisted();
     if (saved) {
       segments = saved.segments ?? [];
       currentSegment = saved.currentSegment ?? null;
     }
-    const savedHistory = loadPersistedHistory();
-    if (savedHistory) {
-      sessionHistory = savedHistory.sessionHistory ?? [];
-    } else if (saved && Array.isArray(saved.sessionHistory)) {
-      // One-time migration: sessionHistory used to live in the combined
-      // blob above. Adopt it here and let the next persist() write it into
-      // its own key; the old key stops carrying it on its next write.
-      sessionHistory = saved.sessionHistory;
-      historyDirty = true;
+    const loadedManifest = loadArchiveManifest();
+    if (loadedManifest) {
+      archiveManifest = loadedManifest;
+    } else {
+      // One-time migration from either the pre-split combined blob's
+      // sessionHistory array, or the short-lived ctp-state-history-<world>-
+      // <user> key that superseded it - both held a 2-entry ring buffer of
+      // { segments, endedAt }. Each entry becomes its own manifest row and
+      // its own archived-session key. Not routed through
+      // writeArchivedSession()/notifyStorageError() - this runs before
+      // buildPanel() exists (see hard constraint #4 in AGENTS.md), same
+      // reason loadFailed's own toast is deferred below.
+      let legacyHistory = null;
+      try {
+        const legacyKey = `ctp-state-history-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
+        const legacyBlob = JSON.parse(localStorage.getItem(legacyKey) ?? "null");
+        legacyHistory = Array.isArray(legacyBlob?.sessionHistory) ? legacyBlob.sessionHistory : null;
+      } catch (e) {
+        console.warn("Combat Timer: could not read legacy session history", e);
+      }
+      if (!legacyHistory && saved && Array.isArray(saved.sessionHistory)) legacyHistory = saved.sessionHistory;
+      if (legacyHistory?.length) {
+        for (const entry of legacyHistory) {
+          if (!entry?.segments?.length) continue;
+          const id = uid();
+          const startedAt = entry.segments[0]?.start ?? entry.endedAt ?? Date.now();
+          archiveManifest.push({ id, startedAt, endedAt: entry.endedAt ?? Date.now() });
+          try {
+            localStorage.setItem(archivedSessionKey(id), JSON.stringify({ v: 1, segments: entry.segments }));
+          } catch (e) {
+            console.warn("Combat Timer: could not migrate an archived session", e);
+            loadFailed = true;
+          }
+        }
+        manifestDirty = true;
+      }
     }
 
     function uid() {
@@ -349,14 +409,43 @@
     // ACTUAL Combat id has changed from whatever the current session was
     // tracking - this is more robust than relying on the "combatStart" hook
     // alone (which may not fire for every reset-and-restart edge case).
-    let selectedSession = "current"; // "current" | "prev1" | "prev2" - display only, NOT the live data
+    let selectedSession = "current"; // "current" | an archived session's id - display only, NOT the live data
     let playerPickerSegId = null; // which segment's player-reassignment picker is expanded, if any
+
+    // Evicts the oldest archived sessions beyond ui.maxArchivedSessions -
+    // called both right after a new one is added, and immediately when the
+    // user lowers the cap in renderArchiveList() (so a lowered cap takes
+    // effect right away rather than waiting for the next archive event).
+    // Manifest row and storage key are removed together so nothing orphaned
+    // is left behind.
+    function enforceArchiveCap() {
+      const cap = Math.max(1, ui.maxArchivedSessions);
+      while (archiveManifest.length > cap) {
+        const evicted = archiveManifest.pop();
+        localStorage.removeItem(archivedSessionKey(evicted.id));
+        invalidateViewedArchive(evicted.id);
+        if (selectedSession === evicted.id) selectedSession = "current";
+        manifestDirty = true;
+        toast(`Archived session limit (${cap}) reached - oldest session (${formatArchiveLabel(evicted.startedAt)}) removed.`);
+      }
+    }
+
+    // Adds a brand-new archived session (a live archive, or an "import as new"
+    // action - see importSessionFromFile()), enforcing ui.maxArchivedSessions
+    // via enforceArchiveCap().
+    function addArchivedSession(startedAt, endedAt, segs) {
+      const id = uid();
+      writeArchivedSession(id, segs);
+      archiveManifest.unshift({ id, startedAt, endedAt });
+      manifestDirty = true;
+      enforceArchiveCap();
+      return id;
+    }
+
     function archiveSessionIfNeeded() {
       closeSegment();
       if (!segments.length) return;
-      historyDirty = true;
-      sessionHistory.unshift({ segments, endedAt: Date.now() });
-      sessionHistory = sessionHistory.slice(0, 2);
+      addArchivedSession(segments[0].start, Date.now(), segments);
       segments = [];
       currentSegment = null;
       liveDirty = true; // segments/currentSegment just reset to empty
@@ -371,9 +460,22 @@
 
     function getSelectedSessionData() {
       if (selectedSession === "current") return { segs: segments, current: currentSegment };
-      const idx = selectedSession === "prev1" ? 0 : 1;
-      const hist = sessionHistory[idx];
-      return { segs: hist ? hist.segments : [], current: null };
+      ensureViewedArchiveLoaded();
+      return { segs: viewedArchive?.segments ?? [], current: null };
+    }
+    // localStorage.getItem is synchronous, but re-parsing an archived
+    // session's JSON on every render tick would be wasteful - this only
+    // reloads when the selection actually changed since the last call.
+    function ensureViewedArchiveLoaded() {
+      if (viewedArchive && viewedArchive.id === selectedSession) return;
+      viewedArchive = { id: selectedSession, segments: loadArchivedSessionSegments(selectedSession) };
+    }
+    // Forces the next ensureViewedArchiveLoaded() to reload from storage -
+    // needed after a write to an archived session's key that didn't go
+    // through the in-memory viewedArchive object itself (import, undo,
+    // eviction), so a stale cached copy doesn't linger on screen.
+    function invalidateViewedArchive(id) {
+      if (viewedArchive?.id === id) viewedArchive = null;
     }
 
     function switchTurn(combat) {
@@ -472,7 +574,7 @@
     // can resolve to an archived session's segment just as easily as a live one.
     function markSelectedSessionDirty() {
       if (selectedSession === "current") liveDirty = true;
-      else historyDirty = true;
+      else archiveDirty = true;
     }
 
     // Single source of truth for "does this segment have real combat context
@@ -1311,17 +1413,19 @@
           archiveSessionIfNeeded();
           reconcileWithLiveState();
           persist();
-          toast("New session started. The old one is under “Prev”.");
+          toast("New session started. The old one is under “Archived”.");
           renderPanel();
         });
         return;
       }
-      const idx = selectedSession === "prev1" ? 0 : 1;
-      if (!sessionHistory[idx]) return;
+      const entry = archiveManifest.find((s) => s.id === selectedSession);
+      if (!entry) return;
       confirmBar("Delete this archived session? No undo.", "Delete", () => {
-        sessionHistory.splice(idx, 1);
+        archiveManifest = archiveManifest.filter((s) => s.id !== entry.id);
+        localStorage.removeItem(archivedSessionKey(entry.id));
+        invalidateViewedArchive(entry.id);
         selectedSession = "current";
-        historyDirty = true;
+        manifestDirty = true;
         persist();
         toast("Archived session deleted.");
         renderPanel();
@@ -1329,17 +1433,18 @@
     }
 
     // Exports only the currently VIEWED session (whichever tab is selected),
-    // not the full ring buffer - matches "what you're looking at" rather than
+    // not the whole archive - matches "what you're looking at" rather than
     // requiring a full-state restore just to move one session elsewhere.
     function exportSelectedSession() {
       const { segs, current } = getSelectedSessionData();
-      const idx = selectedSession === "prev1" ? 0 : selectedSession === "prev2" ? 1 : null;
+      const entry = selectedSession === "current" ? null : archiveManifest.find((s) => s.id === selectedSession);
       const payload = {
         v: 1, // matches the schema version persist() writes - see makeSegment()
         exportedAt: Date.now(),
         world: game.world?.id ?? null,
-        session: selectedSession, // "current" | "prev1" | "prev2" - informational, doesn't constrain re-import
-        endedAt: idx !== null ? (sessionHistory[idx]?.endedAt ?? null) : null,
+        session: selectedSession, // "current" | an archived session's id - informational, doesn't constrain re-import
+        startedAt: entry?.startedAt ?? (segs[0]?.start ?? null),
+        endedAt: entry?.endedAt ?? null,
         segments: segs,
         currentSegment: current,
       };
@@ -1348,17 +1453,23 @@
       const a = document.createElement("a");
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       a.href = url;
-      a.download = `combat-timer-${game.world?.id ?? "world"}-${selectedSession}-${stamp}.json`;
+      a.download = `combat-timer-${game.world?.id ?? "world"}-${selectedSession === "current" ? "current" : "archived"}-${stamp}.json`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
     }
 
-    // Replaces whichever session is currently viewed with the imported file's
-    // data outright - no archiving of what was there before, matching export
-    // being scoped to "just the viewed session" rather than the full state.
+    // Set right before the hidden file input is clicked (see renderMenu()) -
+    // "replace" overwrites whichever session is currently viewed (the
+    // long-standing behavior); "new" always adds a brand-new archived entry
+    // regardless of what's selected, replacing the old "select an empty
+    // archived slot to import into it" path that a fixed-size ring buffer
+    // used to offer and a manifest of only-ever-real entries no longer has.
+    let importMode = "replace";
+
     function importSessionFromFile(file) {
+      const mode = importMode;
       const reader = new FileReader();
       reader.onload = () => {
         let parsed;
@@ -1372,30 +1483,52 @@
           toast("That file isn't Combat Timer session data.");
           return;
         }
-        const label = selectedSession === "current" ? "Now" : selectedSession === "prev1" ? "Prev" : "Older";
-        confirmBar(`Replace the “${label}” tab with this file?`, "Replace", () => {
+        // Imported data is assumed to already be in the current segment
+        // shape (this script only supports data it wrote itself) - no
+        // backfilling for fields from an older script version.
+        const importedSegments = parsed.segments;
+        const importedCurrent = parsed.currentSegment ?? null;
+
+        if (mode === "new") {
+          confirmBar("Import this file as a new archived session?", "Import", () => {
+            const startedAt = parsed.startedAt ?? importedSegments[0]?.start ?? Date.now();
+            const endedAt = parsed.endedAt ?? Date.now();
+            const id = addArchivedSession(startedAt, endedAt, importedSegments);
+            importUndo = { session: "new", id };
+            selectedSession = id;
+            persist();
+            renderPanel();
+            toast(`Imported as a new archived session (${formatArchiveLabel(startedAt)}).`, "Undo", () => undoImport());
+          });
+          return;
+        }
+
+        const label = selectedSession === "current" ? "Now"
+          : formatArchiveLabel(archiveManifest.find((s) => s.id === selectedSession)?.startedAt ?? Date.now());
+        confirmBar(`Replace the “${label}” session with this file?`, "Replace", () => {
           // One-level snapshot taken immediately before the overwrite. Import
           // still replaces outright (no archiving), but the thing it replaced
           // is now recoverable for as long as the panel stays open.
-          importUndo = selectedSession === "current"
-            ? { session: "current", segments: [...segments], currentSegment }
-            : { session: selectedSession, entry: sessionHistory[selectedSession === "prev1" ? 0 : 1] ?? null };
-
-          // Imported data is assumed to already be in the current segment
-          // shape (this script only supports data it wrote itself) - no
-          // backfilling for fields from an older script version.
-          const importedSegments = parsed.segments;
-          const importedCurrent = parsed.currentSegment ?? null;
-
           if (selectedSession === "current") {
+            importUndo = { session: "current", segments: [...segments], currentSegment };
             segments = importedSegments;
             currentSegment = importedCurrent;
             liveDirty = true;
             reconcileWithLiveState(); // imported data may not match what's actually live right now
           } else {
-            const idx = selectedSession === "prev1" ? 0 : 1;
-            sessionHistory[idx] = { segments: importedSegments, endedAt: parsed.endedAt ?? Date.now() };
-            historyDirty = true;
+            const entry = archiveManifest.find((s) => s.id === selectedSession);
+            importUndo = {
+              session: selectedSession,
+              segments: viewedArchive?.segments ?? loadArchivedSessionSegments(selectedSession),
+              entry: entry ? { ...entry } : null,
+            };
+            writeArchivedSession(selectedSession, importedSegments);
+            if (entry) {
+              entry.startedAt = parsed.startedAt ?? importedSegments[0]?.start ?? entry.startedAt;
+              entry.endedAt = parsed.endedAt ?? Date.now();
+            }
+            invalidateViewedArchive(selectedSession);
+            manifestDirty = true;
           }
           persist();
           renderPanel();
@@ -1405,9 +1538,9 @@
       reader.readAsText(file);
     }
 
-    // Restores whatever the last import overwrote. Only one level deep and
-    // only for this page session - it's a safety net for a misclick, not a
-    // history feature.
+    // Restores whatever the last import overwrote or created. Only one level
+    // deep and only for this page session - it's a safety net for a
+    // misclick, not a history feature.
     function undoImport() {
       if (!importUndo) return;
       if (importUndo.session === "current") {
@@ -1415,11 +1548,25 @@
         currentSegment = importUndo.currentSegment;
         liveDirty = true;
         reconcileWithLiveState();
+      } else if (importUndo.session === "new") {
+        // "Import as new" created a brand-new manifest entry - undo removes
+        // it outright, the same as a manual delete.
+        archiveManifest = archiveManifest.filter((s) => s.id !== importUndo.id);
+        localStorage.removeItem(archivedSessionKey(importUndo.id));
+        invalidateViewedArchive(importUndo.id);
+        if (selectedSession === importUndo.id) selectedSession = "current";
+        manifestDirty = true;
       } else {
-        const idx = importUndo.session === "prev1" ? 0 : 1;
-        if (importUndo.entry) sessionHistory[idx] = importUndo.entry;
-        else sessionHistory.splice(idx, 1);
-        historyDirty = true;
+        // A replace-in-place import on an archived session - restore its
+        // previous segments and manifest metadata.
+        writeArchivedSession(importUndo.session, importUndo.segments);
+        const entry = archiveManifest.find((s) => s.id === importUndo.session);
+        if (entry && importUndo.entry) {
+          entry.startedAt = importUndo.entry.startedAt;
+          entry.endedAt = importUndo.entry.endedAt;
+        }
+        invalidateViewedArchive(importUndo.session);
+        manifestDirty = true;
       }
       importUndo = null;
       persist();
@@ -1444,7 +1591,7 @@
     function uiStorageKey() {
       return `ctp-ui-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
-    const UI_DEFAULTS = { left: null, top: 60, panelWidth: 300, segHeight: 240, summaryOpen: false };
+    const UI_DEFAULTS = { left: null, top: 60, panelWidth: 300, segHeight: 240, summaryOpen: false, maxArchivedSessions: 10 };
     let ui = { ...UI_DEFAULTS };
     try {
       const savedUi = JSON.parse(localStorage.getItem(uiStorageKey()) ?? "null");
@@ -1473,6 +1620,7 @@
     let openCatSegId = null;            // which segment has its category picker open
     let menuOpen = false;               // the ⋯ overflow menu
     let postMenuOpen = false;           // the "Post report" dropdown
+    let archivePickerOpen = false;      // the "Archived" session list
     let importUndo = null;              // one-level undo snapshot taken right before an import
     let lastSegSig = null;              // see renderSegments(): skips the rebuild when nothing changed
     let toastTimer = null;
@@ -1491,6 +1639,13 @@
     function formatClock(ts) {
       const d = new Date(ts);
       return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    }
+    // Archived sessions are labeled by when the combat STARTED (not ended) -
+    // includes the date since, unlike formatClock()'s HH:MM, this has to stay
+    // unambiguous across a list that can span weeks or months.
+    function formatArchiveLabel(ts) {
+      const d = new Date(ts);
+      return `${d.toLocaleString(undefined, { month: "short" })} ${d.getDate()}, ${formatClock(ts)}`;
     }
     // WCAG relative luminance, used to decide whether a label drawn ON a fill
     // should be dark or light. The bar segments are shaded down to 45% of the
@@ -1680,6 +1835,9 @@
 
         <div id="ctp-tabs" style="display:flex; gap:4px; padding:6px 8px; background:${THEME.sectionBg};
              border-bottom:1px solid ${THEME.border}; font-size:11px;"></div>
+
+        <div id="ctp-archive-list" style="display:none; max-height:160px; overflow-y:auto; font-size:11px;
+             background:${THEME.sectionBg}; border-bottom:1px solid ${THEME.border}; padding:4px;"></div>
 
         <div id="ctp-live" style="padding:8px 10px; border-bottom:1px solid ${THEME.borderMuted};"></div>
 
@@ -1909,6 +2067,7 @@
         ...(archived ? [{ key: "delete", label: "🗑️ Delete this archived session", hint: "permanent", danger: true }] : []),
         { key: "export", label: "📤 Export this session" },
         { key: "import", label: "📥 Import into this session" },
+        { key: "importnew", label: "📥 Import as a new archived session" },
         ...(importUndo ? [{ key: "undo", label: "↩ Undo last import" }] : []),
         { key: "dummy", label: "🧪 Load dummy data", hint: "only if empty" },
         { key: "resetpos", label: "📍 Reset panel position" },
@@ -1927,7 +2086,10 @@
           menuOpen = false;
           if (action === "new" || action === "delete") deleteSelectedSession();
           else if (action === "export") exportSelectedSession();
-          else if (action === "import") panel.querySelector("#ctp-import-file").click();
+          else if (action === "import" || action === "importnew") {
+            importMode = action === "importnew" ? "new" : "replace";
+            panel.querySelector("#ctp-import-file").click();
+          }
           else if (action === "undo") undoImport();
           else if (action === "dummy") loadDummyData();
           else if (action === "resetpos") {
@@ -1943,25 +2105,81 @@
 
     function renderTabs() {
       const el = panel.querySelector("#ctp-tabs");
-      // "hasData" only dims a tab - an empty archived slot must stay clickable,
-      // since selecting it is the only way to import data into it.
-      const tabs = [
-        { key: "current", label: "Now", hasData: true },
-        { key: "prev1", label: "Prev", hasData: !!sessionHistory[0] },
-        { key: "prev2", label: "Older", hasData: !!sessionHistory[1] },
-      ];
-      el.innerHTML = tabs.map((t) => `
-        <span data-session="${t.key}" ${selectedSession === t.key ? "" : "data-hover"}
+      const viewingArchived = selectedSession !== "current";
+      const archivedLabel = viewingArchived
+        ? formatArchiveLabel(archiveManifest.find((s) => s.id === selectedSession)?.startedAt ?? Date.now())
+        : `Archived (${archiveManifest.length})`;
+      el.innerHTML = `
+        <span data-session="current" ${viewingArchived ? "data-hover" : ""}
           style="flex:1; text-align:center; padding:4px 2px; border-radius:5px; cursor:pointer;
-                 ${selectedSession === t.key ? `background:${THEME.accent};` : ""}
-                 opacity:${selectedSession === t.key ? "1" : (t.hasData ? "0.6" : "0.35")};">${t.label}</span>`).join("");
-      el.querySelectorAll("[data-session]").forEach((node) => {
+                 ${viewingArchived ? "" : `background:${THEME.accent};`}
+                 opacity:${viewingArchived ? "0.6" : "1"};">Now</span>
+        <span id="ctp-archive-toggle" ${viewingArchived ? "" : (archiveManifest.length ? "data-hover" : "")}
+          style="flex:2; text-align:center; padding:4px 2px; border-radius:5px;
+                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+                 ${archiveManifest.length ? "cursor:pointer;" : "cursor:default;"}
+                 ${viewingArchived ? `background:${THEME.accent};` : ""}
+                 opacity:${viewingArchived ? "1" : (archiveManifest.length ? "0.6" : "0.35")};">${archivedLabel} ▾</span>`;
+      el.querySelector('[data-session="current"]').addEventListener("click", () => {
+        selectedSession = "current";
+        archivePickerOpen = false;
+        openCatSegId = null;
+        playerPickerSegId = null;
+        expandedGroups = new Set();
+        liveGroupsSeeded = new Set();
+        renderPanel();
+      });
+      el.querySelector("#ctp-archive-toggle").addEventListener("click", () => {
+        if (!archiveManifest.length) return;
+        archivePickerOpen = !archivePickerOpen;
+        renderPanel();
+      });
+    }
+
+    // The list of archived sessions - opened from the "Archived" control in
+    // renderTabs(). A separate section (not folded into renderTabs()) so it
+    // can hold an arbitrary, scrollable number of entries instead of being
+    // squeezed into the fixed-width tab strip the way a 3rd/4th tab would be.
+    function renderArchiveList() {
+      const el = panel.querySelector("#ctp-archive-list");
+      el.style.display = archivePickerOpen ? "block" : "none";
+      if (!archivePickerOpen) return;
+      const cap = ui.maxArchivedSessions;
+      el.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center; font-size:10px; opacity:0.6; padding:2px 4px 4px;">
+          <span>${archiveManifest.length} of ${cap} kept</span>
+          <span style="display:flex; align-items:center; gap:4px;">
+            <span data-archive-cap="-5" data-hover style="cursor:pointer; padding:0 5px; border-radius:4px;">−</span>
+            <span>Keep last ${cap}</span>
+            <span data-archive-cap="5" data-hover style="cursor:pointer; padding:0 5px; border-radius:4px;">+</span>
+          </span>
+        </div>
+        ${archiveManifest.map((s) => `
+          <div class="ctp-chip" data-archive-pick="${s.id}" ${selectedSession === s.id ? "" : "data-hover"}
+            style="display:block; margin:2px 0;
+                   ${selectedSession === s.id ? `background:${THEME.accent};` : `border:1px solid ${THEME.chipBorder};`}">
+            📦 ${formatArchiveLabel(s.startedAt)}
+          </div>`).join("")}
+      `;
+      el.querySelectorAll("[data-archive-pick]").forEach((node) => {
         node.addEventListener("click", () => {
-          selectedSession = node.dataset.session;
+          selectedSession = node.dataset.archivePick;
+          archivePickerOpen = false;
           openCatSegId = null;
           playerPickerSegId = null;
           expandedGroups = new Set();
           liveGroupsSeeded = new Set();
+          renderPanel();
+        });
+      });
+      el.querySelectorAll("[data-archive-cap]").forEach((node) => {
+        node.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const delta = Number(node.dataset.archiveCap);
+          ui.maxArchivedSessions = Math.max(1, ui.maxArchivedSessions + delta);
+          persistUi();
+          enforceArchiveCap(); // lowering the cap evicts excess immediately, not just on the next archive
+          persist();
           renderPanel();
         });
       });
@@ -1973,14 +2191,14 @@
       const totalLine = `<span>${formatDuration(Math.round(sessionMs / 1000))} total</span>`;
 
       if (selectedSession !== "current") {
-        const hist = sessionHistory[selectedSession === "prev1" ? 0 : 1];
-        el.innerHTML = hist
+        const entry = archiveManifest.find((s) => s.id === selectedSession);
+        el.innerHTML = entry
           ? `<div style="display:flex; justify-content:space-between; font-size:11px; opacity:0.65;">
-               <span>📦 Archived · ended ${formatClock(hist.endedAt)}</span>${totalLine}
+               <span>📦 Archived · started ${formatArchiveLabel(entry.startedAt)}</span>${totalLine}
              </div>
              <div style="font-size:11px; opacity:0.5; margin-top:5px;">Read-only view. Tracking continues on “Now”.</div>`
-          : `<div style="font-size:11px; opacity:0.65;">📦 Nothing in this slot yet</div>
-             <div style="font-size:11px; opacity:0.5; margin-top:5px;">Import a session file here, or it fills itself the next time a session archives.</div>`;
+          : `<div style="font-size:11px; opacity:0.65;">📦 This archived session is gone</div>
+             <div style="font-size:11px; opacity:0.5; margin-top:5px;">It may have just been deleted. Pick another from “Archived”.</div>`;
         return;
       }
 
@@ -2623,6 +2841,7 @@
       if (!panelVisible || !document.body.contains(panel)) return;
       renderMenu();
       renderTabs();
+      renderArchiveList();
       renderLive();
       renderSummary();
       renderFilters();
@@ -2638,10 +2857,11 @@
     // open.
     document.addEventListener("pointerdown", (ev) => {
       if (!panel || !document.body.contains(panel)) return;
-      if (!menuOpen && !postMenuOpen) return;
-      if (ev.target.closest("#ctp-menu, #ctp-menu-btn, #ctp-post-menu, #ctp-post")) return;
+      if (!menuOpen && !postMenuOpen && !archivePickerOpen) return;
+      if (ev.target.closest("#ctp-menu, #ctp-menu-btn, #ctp-post-menu, #ctp-post, #ctp-archive-list, #ctp-archive-toggle")) return;
       menuOpen = false;
       postMenuOpen = false;
+      archivePickerOpen = false;
       renderPanel();
     });
   }

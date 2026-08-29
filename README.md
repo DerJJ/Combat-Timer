@@ -14,9 +14,9 @@ A Tampermonkey userscript for [Foundry VTT](https://foundryvtt.com/) that tracks
 - An instantly-skipped dead monster's turn never skews anyone's average turn length, but its time isn't lost either — it's credited to whoever the monster's turns were last attributed to (a specific player if it had been reassigned, otherwise the GM). A defeated player character still gets a normal turn (death saves and the like are real activity), counted exactly like any other turn.
 - Uses each player's own Foundry-configured color for a consistent look.
 - Posts two kinds of chat report — a bar chart of time per person, and a player overview with average turn length, average gap between turns, and total wait time. Both render identically for everyone in chat, whether or not they have this script installed.
-- Keeps a short history: the current combat plus the last 2 finished ones, switchable via tabs, so you don't lose data when a new fight starts.
+- Keeps a history of finished combats (10 by default, adjustable), picked from an "Archived" list, so you don't lose data when a new fight starts.
 - Everything persists across page reloads and browser restarts (stored locally in your browser).
-- Export any session to a JSON file, and import one back in — for backups or moving data to another browser.
+- Export any session to a JSON file, and import one back in — either replacing the session you're viewing, or as a brand-new archived entry — for backups or moving data to another browser.
 
 ## Requirements
 
@@ -48,8 +48,8 @@ The panel opens automatically. If you close it (✕), a small reopen button appe
 
 Top to bottom, the panel reads in the order things are scoped:
 
-- **Header**: `⋯` opens the actions menu (new session, delete an archived one, export, import, undo the last import, dummy data, reset the panel's position). `✕` hides the panel — a small `⚔️` button appears on the left edge of the screen to bring it back. Drag the header to move the panel; its position is remembered.
-- **Session tabs** (Now / Prev / Older): switch which session is shown and which one a chat report covers. A greyed-out tab has no data yet, but you can still open it — that's how you get an empty slot ready to receive an import.
+- **Header**: `⋯` opens the actions menu (new session, delete an archived one, export, import — replacing the viewed session or as a new archived entry, undo the last import, dummy data, reset the panel's position). `✕` hides the panel — a small `⚔️` button appears on the left edge of the screen to bring it back. Drag the header to move the panel; its position is remembered.
+- **Session picker**: **Now** switches to live tracking; **Archived** opens a list of finished combats, each labeled by when it started, to pick which one is shown and which one a chat report covers. The list also has a small control to change how many archived sessions are kept (10 by default) — lowering it removes the oldest right away, and archiving past the limit removes the oldest automatically with a toast saying so.
 - **Live line**: the current round and turn, the session total, and whoever is on the clock right now with their running time. **✂️ Split** cuts the running segment in two right there, e.g. to carve out a reaction mid-turn so it can be categorized separately.
 - **Summary**: one bar showing how the session's time divides up. Hover a slice for the name and total. **Details** expands it into a labelled list of everyone, plus the Team and Setup categories when they have any time.
 - **Filter**: narrows the segment list to Setup/Ignore, to anything you've reassigned, or to segments over a minute.
@@ -66,7 +66,7 @@ The Post report button offers two reports, visible only to you at first ("self r
 
 ### A new combat, a new session
 
-Starting a new combat encounter automatically archives the previous session and starts tracking fresh. The last 2 sessions stay available under the "-1" / "-2" tabs so you can still post a report from a fight that already ended.
+Starting a new combat encounter automatically archives the previous session and starts tracking fresh. Archived sessions stay available under "Archived" (10 kept by default, adjustable there) so you can still post a report from a fight that already ended.
 
 ## Notes and limitations
 
