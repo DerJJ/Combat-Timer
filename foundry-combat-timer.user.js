@@ -3,7 +3,7 @@
 // @namespace    https://local.private/
 // @version      0.2
 // @author       DerJJ/Umek
-// @description  Persistent, segmented combat time tracking with a session ring buffer (current + last 2), automatic new session on combat start, dummy data button, Player/GM/Team/Setup/Ignore categorization, player/GM colors, owner-based grouping, defeated filter, two self-roll chat reports (dnd5e & pf2e)
+// @description  Persistent, segmented combat time tracking with an adjustable archived-session history plus a long-term campaign log, automatic new session on combat start, dummy data button, Player/GM/Team/Setup/Ignore categorization with manual reassignment, player/GM colors, JSON export/import, and eight self-roll chat reports (bar chart, player list, round pacing, fun facts, GM overhead, recent combats, pauses, campaign trend) for dnd5e & pf2e
 // @match        https://YOUR-SERVER-1.example.com/*
 // @match        https://YOUR-SERVER-2.example.com/*
 // @match        https://YOUR-SERVER-3.example.com/*
