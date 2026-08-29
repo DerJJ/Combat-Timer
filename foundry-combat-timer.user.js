@@ -63,11 +63,22 @@
     function storageKey() {
       return `ctp-state-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
+    // Throttled so a persistently-failing persist() (e.g. quota permanently
+    // exceeded) surfaces once rather than spamming a toast every render tick.
+    let lastStorageErrorToastAt = 0;
+    const STORAGE_ERROR_TOAST_THROTTLE_MS = 30000;
+    function notifyStorageError(message) {
+      const now = Date.now();
+      if (now - lastStorageErrorToastAt < STORAGE_ERROR_TOAST_THROTTLE_MS) return;
+      lastStorageErrorToastAt = now;
+      toast(message);
+    }
     function loadPersisted() {
       try {
         return JSON.parse(localStorage.getItem(storageKey()) ?? "null");
       } catch (e) {
         console.warn("Combat Timer: could not load saved state", e);
+        loadFailed = true;
         return null;
       }
     }
@@ -76,6 +87,7 @@
         localStorage.setItem(storageKey(), JSON.stringify({ v: 1, segments, currentSegment, sessionHistory }));
       } catch (e) {
         console.warn("Combat Timer: could not save state", e);
+        notifyStorageError("Could not save combat-timer data - check browser storage.");
       }
     }
 
@@ -83,6 +95,7 @@
     let currentSegment = null;  // current session: the running segment
     let sessionHistory = [];    // ring buffer: last 2 finished sessions, newest first
     let panelVisible = true;
+    let loadFailed = false;     // set by loadPersisted() on error; toasted once buildPanel() exists
 
     const saved = loadPersisted();
     if (saved) {
@@ -1780,6 +1793,10 @@
 
     panel = buildPanel();
     injectPanelStyles();
+    // Deferred until here (not raised from loadPersisted() itself) because
+    // toast() reads `panel`, and loadPersisted() runs before buildPanel() -
+    // see hard constraint #4 in AGENTS.md on nothing preceding buildPanel().
+    if (loadFailed) notifyStorageError("Could not load saved combat-timer data - starting fresh.");
 
     // Note: a scene-controls toolbar button was attempted and abandoned.
     // getSceneControlButtons fires exactly once, very early during Foundry's
