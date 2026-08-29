@@ -83,11 +83,14 @@
       }
     }
     function persist() {
+      if (!dirty) return; // nothing changed since the last successful write
       try {
         localStorage.setItem(storageKey(), JSON.stringify({ v: 1, segments, currentSegment, sessionHistory }));
+        dirty = false;
       } catch (e) {
         console.warn("Combat Timer: could not save state", e);
         notifyStorageError("Could not save combat-timer data - check browser storage.");
+        // dirty stays true so the next tick retries the write
       }
     }
 
@@ -96,6 +99,7 @@
     let sessionHistory = [];    // ring buffer: last 2 finished sessions, newest first
     let panelVisible = true;
     let loadFailed = false;     // set by loadPersisted() on error; toasted once buildPanel() exists
+    let dirty = false;          // set at every real mutation of segments/currentSegment/sessionHistory; persist() no-ops without it
 
     const saved = loadPersisted();
     if (saved) {
@@ -173,6 +177,7 @@
 
     function closeSegment() {
       if (!currentSegment) return;
+      dirty = true;
       currentSegment.end = currentSegment.end ?? Date.now();
       const prev = segments[segments.length - 1] ?? null;
       if (currentSegment.trigger === "pause" && prev && segMs(currentSegment) < SHORT_PAUSE_MERGE_THRESHOLD_MS) {
@@ -212,6 +217,7 @@
     }
 
     function openSegment(trigger, combatant, combat = null) {
+      dirty = true;
       const prev = segments[segments.length - 1] ?? null;
       const ownerId = getOwningPlayerId(combatant?.actor);
       currentSegment = makeSegment({
@@ -285,6 +291,7 @@
     function archiveSessionIfNeeded() {
       closeSegment();
       if (!segments.length) return;
+      dirty = true;
       sessionHistory.unshift({ segments, endedAt: Date.now() });
       sessionHistory = sessionHistory.slice(0, 2);
       segments = [];
@@ -332,6 +339,7 @@
       // segment is marked defeated (excluded from every aggregate) before
       // reconcileWithLiveState() closes it out and picks up whatever's next.
       if (currentSegment?.combatantId === combatant.id) {
+        dirty = true;
         currentSegment.defeated = true;
         reconcileWithLiveState();
       }
@@ -362,7 +370,10 @@
         const liveName = c.name ?? c.token?.name ?? null;
         if (!liveName) continue;
         for (const seg of liveSegs) {
-          if (seg.combatantId === c.id && seg.combatantName !== liveName) seg.combatantName = liveName;
+          if (seg.combatantId === c.id && seg.combatantName !== liveName) {
+            seg.combatantName = liveName;
+            dirty = true;
+          }
         }
       }
     }
@@ -808,6 +819,7 @@
       }
       segments = generateDummySegments();
       currentSegment = null;
+      dirty = true;
       persist();
       toast("Dummy data loaded.");
     }
@@ -1238,6 +1250,7 @@
       confirmBar("Delete this archived session? No undo.", "Delete", () => {
         sessionHistory.splice(idx, 1);
         selectedSession = "current";
+        dirty = true;
         persist();
         toast("Archived session deleted.");
         renderPanel();
@@ -1311,6 +1324,7 @@
             const idx = selectedSession === "prev1" ? 0 : 1;
             sessionHistory[idx] = { segments: importedSegments, endedAt: parsed.endedAt ?? Date.now() };
           }
+          dirty = true;
           persist();
           renderPanel();
           toast(`Imported into “${label}”.`, "Undo", () => undoImport());
@@ -1334,6 +1348,7 @@
         else sessionHistory.splice(idx, 1);
       }
       importUndo = null;
+      dirty = true;
       persist();
       toast("Import undone.");
       renderPanel();
@@ -2480,6 +2495,7 @@
           seg.overrideOwnerId = null;
           playerPickerSegId = null;
           openCatSegId = null;
+          dirty = true;
           persist();
           toast(`Marked as ${CATEGORY_META[cat].label}.`);
           renderPanel();
@@ -2495,6 +2511,7 @@
           seg.overrideOwnerId = pick === "__default__" ? null : pick;
           playerPickerSegId = null;
           openCatSegId = null;
+          dirty = true;
           persist();
           toast(pick === "__default__" ? "Back to the default owner." : `Reassigned to ${ownerName(pick)}.`);
           renderPanel();
