@@ -549,6 +549,39 @@
     return { roundCount: rounds.size, avgMs: rounds.size ? ms / rounds.size : 0 };
   }
 
+  // Buckets every round's tracked time by who it belongs to, for the
+  // round-pacing chat report - same ownership rules summaryEntries() uses
+  // for the main chart (player/GM via countsForGM()/effectiveOwner(), plus
+  // Team/Setup as their own buckets), just partitioned per round instead of
+  // summed across the whole session. Segments with no round (round == null)
+  // are skipped - there's no round to attribute them to - so a round made
+  // up entirely of such segments produces no entry at all, same as it stays
+  // invisible to gmRoundStats()'s round count. Returns ascending by round
+  // number; each round's bucket is keyed by ownerId, or the sentinel
+  // "gm"/"team"/"setup" - a real Foundry user id never collides with those.
+  // Kept ownerId-only (no name/color) so this stays a pure, game.users-free
+  // function; init() resolves display info the same way summaryEntries()
+  // already does for perCombatantStats()/gmTotalStats().
+  function roundPacingStats(segs) {
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    const rounds = new Map(); // round number -> Map(bucketKey -> ms)
+    for (const seg of segs) {
+      if (seg.round == null) continue;
+      let key = null;
+      if (seg.category === "team") key = "team";
+      else if (seg.category === "setup") key = "setup";
+      else if (countsForGM(seg, lastLiveOwner)) key = "gm";
+      else if ((seg.category === "player" || seg.category === "gm") && hasCombatContext(seg)) {
+        key = effectiveOwner(seg, lastLiveOwner); // claimed -> perCombatantStats()'s scope; null here can't happen (countsForGM() above already caught the unclaimed case)
+      }
+      if (key === null) continue;
+      if (!rounds.has(seg.round)) rounds.set(seg.round, new Map());
+      const bucket = rounds.get(seg.round);
+      bucket.set(key, (bucket.get(key) ?? 0) + segMs(seg));
+    }
+    return [...rounds.entries()].sort((a, b) => a[0] - b[0]).map(([round, byKey]) => ({ round, byKey }));
+  }
+
   function waitForFoundryReady(cb) {
     function attach() {
       if (window.game?.ready) return cb();
@@ -1438,6 +1471,71 @@
         title: "⚔️ Combat Times",
         subtitle: `Total ${formatDuration(Math.round(sessionMs / 1000))}`,
         body: bars + legend,
+      });
+    }
+
+    // "+N more" merged color for a round with more contributors than
+    // capEntities()'s cap. Unlike buildPlayerBarRows()/buildGmBarSegments()
+    // (shades of ONE owner's own color), a round's segments are genuinely
+    // different people with their own distinct colors already - so the
+    // merged slice gets its own fixed, category-independent grey instead of
+    // a shade derived from any one of them.
+    const ROUND_MERGED_COLOR = "#54545f";
+
+    // One row per round, each a bar stacked with that round's contributors
+    // in their own real colors (not shaded - see ROUND_MERGED_COLOR above),
+    // sized relative to the longest round so a bar that bogs down visibly
+    // reads longer than a quick one. Built on roundPacingStats() (which only
+    // knows ownerIds/sentinel keys) the same way summaryEntries() builds on
+    // perCombatantStats()/gmTotalStats()/categoryTotals() - this is where
+    // those keys become display names/colors via game.users.
+    function buildRoundPacingContent() {
+      const segs = allSegments();
+      const rounds = roundPacingStats(segs);
+      const roundTotals = rounds.map(({ byKey }) => [...byKey.values()].reduce((sum, ms) => sum + ms, 0));
+      const max = Math.max(1, ...roundTotals);
+
+      const rows = rounds.map(({ round, byKey }, i) => {
+        const items = [...byKey.entries()].map(([key, ms]) => {
+          if (key === "team") return { ms, name: "Team", color: TEAM_COLOR };
+          if (key === "setup") return { ms, name: "Setup", color: SETUP_COLOR };
+          if (key === "gm") return { ms, name: "GM", color: getCombatantColor(null) };
+          return { ms, name: ownerName(key), color: getCombatantColor(key) };
+        }).sort((a, b) => b.ms - a.ms);
+
+        // isPrimary anchors on the largest contributor (items[0], since
+        // items is sorted by ms descending) - capEntities() otherwise
+        // anchors on the LAST array element when nothing matches isPrimary
+        // (the right choice for buildGmBarSegments()'s turn-ordered,
+        // unsorted input, but here it would keep the smallest contributor
+        // untouched while merging away some of the largest ones instead).
+        const capped = capEntities(items, (it) => it.ms, (it) => it === items[0]);
+        const parts = capped.map((it) => ({
+          ms: it.ms,
+          color: it.combatantId === "__more__" ? ROUND_MERGED_COLOR : it.color,
+          label: escapeHtml(it.name),
+          labelPct: 28,
+          altLabel: formatDuration(Math.round(it.ms / 1000)),
+          title: it.mergedNames ? it.mergedNames.join(", ") : `${it.name} · ${formatDuration(Math.round(it.ms / 1000))}`,
+        }));
+
+        const pct = Math.max(4, Math.round((roundTotals[i] / max) * 100));
+        return `
+          <div style="margin:6px 0;">
+            <div style="display:flex; justify-content:space-between; gap:6px; font-size:11px; margin-bottom:2px; color:#eee !important;">
+              <span style="color:#eee !important;">🔄 Round ${round}</span>
+              <span style="opacity:0.85; color:#eee !important;">${formatDuration(Math.round(roundTotals[i] / 1000))}</span>
+            </div>
+            <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
+              <div style="width:${pct}%; height:100%; display:flex;">${proportionalSegmentsHtml(parts, 12)}</div>
+            </div>
+          </div>`;
+      }).join("");
+
+      return wrapCard({
+        title: "📈 Round Pacing",
+        subtitle: rounds.length ? `${rounds.length} round${rounds.length === 1 ? "" : "s"}` : "",
+        body: rows,
       });
     }
 
@@ -2941,6 +3039,7 @@
       const options = [
         { key: "bars", label: "📊 Bar chart — time per person" },
         { key: "players", label: "🧑 Player list — turn, gap, wait" },
+        { key: "rounds", label: "📈 Round pacing — time per round" },
       ];
       el.innerHTML = `
         <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
@@ -2953,7 +3052,8 @@
           const kind = node.dataset.post;
           postMenuOpen = false;
           renderPanel();
-          await postToChat(kind === "bars" ? buildBarsContent() : buildPlayerListContent(), kind);
+          const content = kind === "bars" ? buildBarsContent() : kind === "players" ? buildPlayerListContent() : buildRoundPacingContent();
+          await postToChat(content, kind);
           toast("Posted to chat — only you can see it.");
         });
       });
@@ -3006,7 +3106,7 @@
       gaussianRandom, randomGaussianDurationMs,
       lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
       buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
-      absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
+      absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats, roundPacingStats,
     };
   }
 })();

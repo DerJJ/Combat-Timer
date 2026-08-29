@@ -12,6 +12,7 @@ const {
   lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
   buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
   absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
+  roundPacingStats,
 } = require("../foundry-combat-timer.user.js");
 
 // Minimal segment builder - only the fields a given test actually cares
@@ -174,6 +175,36 @@ test("ownTurnSlotsByOwner only counts a player's own real turn-opening slots", (
   assert.equal(byOwner.has(null), false); // the GM/monster slot has no designatedOwner
   assert.equal(spanStart, 0);
   assert.equal(spanEnd, 3500);
+});
+
+test("roundPacingStats buckets by round then owner, using the sentinel keys for GM/Team/Setup", () => {
+  const segs = [
+    ...twoRoundScenario(), // p1 turn (round 1), gob1 unclaimed turn (round 1), p1 turn (round 2)
+    seg({ id: "team1", combatantId: null, ownerId: null, category: "team", start: 3500, end: 4000, round: 2 }),
+    seg({ id: "setup1", combatantId: null, ownerId: null, category: "setup", start: 4000, end: 4200, round: 2 }),
+  ];
+  const rounds = roundPacingStats(segs);
+  assert.deepEqual(rounds.map((r) => r.round), [1, 2]); // ascending, no duplicates
+
+  const round1 = rounds[0].byKey;
+  assert.equal(round1.get("p1"), 1000); // t1
+  assert.equal(round1.get("gm"), 1000); // t2, unclaimed monster turn
+
+  const round2 = rounds[1].byKey;
+  assert.equal(round2.get("p1"), 1500); // t3
+  assert.equal(round2.get("team"), 500);
+  assert.equal(round2.get("setup"), 200);
+});
+
+test("roundPacingStats skips segments with no round recorded, and a manual 'gm' recategorization still lands in the 'gm' bucket", () => {
+  const segs = [
+    seg({ id: "noRound", combatantId: "pc1", ownerId: "p1", category: "player", round: null, start: 0, end: 999999 }),
+    seg({ id: "override", combatantId: "pc1", ownerId: "p1", category: "gm", overrideOwnerId: null, round: 1, start: 0, end: 500 }),
+  ];
+  const rounds = roundPacingStats(segs);
+  assert.equal(rounds.length, 1); // the no-round segment contributes nothing
+  assert.equal(rounds[0].byKey.get("gm"), 500); // effectiveOwner() is null for a manual "gm" override -> countsForGM() bucket, not p1
+  assert.equal(rounds[0].byKey.has("p1"), false);
 });
 
 test("session comparison: the same aggregator applied to two independent sessions never mixes their data", () => {
