@@ -59,6 +59,32 @@
     const TEAM_COLOR = "#383E42";
     const SETUP_COLOR = "#6b6f74";
 
+    // Fixed, entity-independent colors that mean the same thing everywhere
+    // they appear - the chat-report indicator row/legend (buildPlayerBarRows,
+    // buildBarsContent) AND the panel's own live "paused" label. Naming them
+    // here removes the literal duplication without changing a single byte of
+    // the self-contained chat HTML those functions still build inline - see
+    // hard constraint #2 in AGENTS.md.
+    const PAUSED_COLOR = "#e8a33d";
+    const OUT_OF_TURN_COLOR = "#4fc3d9";
+
+    // Panel-chrome-only colors (never sent to chat - see hard constraint #2).
+    // Consolidates literals that were previously retyped across buildPanel(),
+    // injectPanelStyles(), renderMenu(), renderTabs(), renderFilters(),
+    // categoryPickerHTML(), toast()/confirmBar(), etc.
+    const THEME = {
+      panelBg: "#17171d",
+      panelText: "#ddd",
+      headerBg: "#2a2a35",
+      sectionBg: "#20202a",     // menu/tabs/post-menu dropdown backgrounds
+      border: "#3a3a46",        // main panel/section borders
+      borderMuted: "#2c2c36",   // lighter dividers between panel sections
+      chipBorder: "#3f3f4c",    // inactive chip/pill outline
+      controlBorder: "#4a4a58", // toast/confirm/split-button outline
+      accent: "#4b3fa0",        // active tab / active filter / post button
+      danger: "#e79a9a",        // destructive menu item text
+    };
+
     // ---- Persistence ----
     function storageKey() {
       return `ctp-state-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
@@ -1114,8 +1140,8 @@
           const outOfTurnMs = Math.max(0, item.outOfTurnMs - pausedMs);
           const inTurnPlainMs = Math.max(0, entMs - pausedMs - outOfTurnMs);
           const parts = proportionalSegmentsHtml([
-            { ms: pausedMs, color: "#e8a33d" }, // fixed, entity-independent - means "paused" everywhere in the report
-            { ms: outOfTurnMs, color: "#4fc3d9" }, // fixed, entity-independent - means "out-of-turn" everywhere
+            { ms: pausedMs, color: PAUSED_COLOR }, // fixed, entity-independent - means "paused" everywhere in the report
+            { ms: outOfTurnMs, color: OUT_OF_TURN_COLOR }, // fixed, entity-independent - means "out-of-turn" everywhere
             { ms: inTurnPlainMs, color },
           ], Infinity); // never label the indicator row - it's a proportion signal, not a number to read
           return `<div style="width:${colWidth}%; height:100%; display:flex;">${parts}</div>`;
@@ -1227,7 +1253,7 @@
              background:${color} !important; vertical-align:middle; margin-right:3px;"></span>`;
       const legend = anyIndicator
         ? `<div style="font-size:9px; opacity:0.5; margin-top:8px; color:#eee !important;">
-             Thin row: ${swatch("#e8a33d")}paused · ${swatch("#4fc3d9")}out of turn
+             Thin row: ${swatch(PAUSED_COLOR)}paused · ${swatch(OUT_OF_TURN_COLOR)}out of turn
            </div>`
         : "";
 
@@ -1580,7 +1606,7 @@
       el.innerHTML = `
         <div style="display:flex; align-items:center; gap:8px;">
           <span style="flex:1;">${escapeHtml(message)}</span>
-          ${actionLabel ? `<span data-toast-action style="cursor:pointer; padding:2px 8px; border-radius:5px; border:1px solid #4a4a58;">${escapeHtml(actionLabel)}</span>` : ""}
+          ${actionLabel ? `<span data-toast-action style="cursor:pointer; padding:2px 8px; border-radius:5px; border:1px solid ${THEME.controlBorder};">${escapeHtml(actionLabel)}</span>` : ""}
         </div>`;
       el.style.display = "block";
       if (actionLabel && onAction) {
@@ -1609,7 +1635,7 @@
       el.innerHTML = `
         <div style="display:flex; align-items:center; gap:6px;">
           <span style="flex:1;">${escapeHtml(message)}</span>
-          <span data-confirm-no style="cursor:pointer; padding:2px 8px; border-radius:5px; border:1px solid #4a4a58;">Cancel</span>
+          <span data-confirm-no style="cursor:pointer; padding:2px 8px; border-radius:5px; border:1px solid ${THEME.controlBorder};">Cancel</span>
           <span data-confirm-yes style="cursor:pointer; padding:2px 8px; border-radius:5px; background:#8c3b3b; color:#fff;">${escapeHtml(confirmLabel)}</span>
         </div>`;
       el.style.display = "block";
@@ -1632,16 +1658,16 @@
       el.style.cssText = `
         position: fixed; top: 60px; right: 16px; z-index: 9999;
         width: ${ui.panelWidth}px; font-family: "Signika", sans-serif; font-size: 12px;
-        background: #17171d;
-        border: 1px solid #3a3a46; border-radius: 10px;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: #ddd; overflow: hidden;
+        background: ${THEME.panelBg};
+        border: 1px solid ${THEME.border}; border-radius: 10px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.5); color: ${THEME.panelText}; overflow: hidden;
       `;
 
       el.innerHTML = `
         <div id="ctp-resize-w" title="Drag to resize the panel width"
              style="position:absolute; left:0; top:0; bottom:0; width:6px; cursor:ew-resize; z-index:3;"></div>
 
-        <div id="ctp-header" style="cursor:move; padding:7px 10px; background:#2a2a35;
+        <div id="ctp-header" style="cursor:move; padding:7px 10px; background:${THEME.headerBg};
              display:flex; justify-content:space-between; align-items:center; user-select:none;">
           <span style="font-weight:600; letter-spacing:0.3px;">⚔️ Combat Times</span>
           <span style="display:flex; gap:2px;">
@@ -1650,37 +1676,37 @@
           </span>
         </div>
 
-        <div id="ctp-menu" style="display:none; background:#20202a; border-bottom:1px solid #3a3a46; padding:4px;"></div>
+        <div id="ctp-menu" style="display:none; background:${THEME.sectionBg}; border-bottom:1px solid ${THEME.border}; padding:4px;"></div>
 
-        <div id="ctp-tabs" style="display:flex; gap:4px; padding:6px 8px; background:#20202a;
-             border-bottom:1px solid #3a3a46; font-size:11px;"></div>
+        <div id="ctp-tabs" style="display:flex; gap:4px; padding:6px 8px; background:${THEME.sectionBg};
+             border-bottom:1px solid ${THEME.border}; font-size:11px;"></div>
 
-        <div id="ctp-live" style="padding:8px 10px; border-bottom:1px solid #2c2c36;"></div>
+        <div id="ctp-live" style="padding:8px 10px; border-bottom:1px solid ${THEME.borderMuted};"></div>
 
-        <div id="ctp-summary" style="padding:8px 10px; border-bottom:1px solid #2c2c36;"></div>
+        <div id="ctp-summary" style="padding:8px 10px; border-bottom:1px solid ${THEME.borderMuted};"></div>
 
         <div id="ctp-filters" style="display:flex; gap:5px; align-items:center; padding:6px 10px;
-             font-size:10px; border-bottom:1px solid #2c2c36;"></div>
+             font-size:10px; border-bottom:1px solid ${THEME.borderMuted};"></div>
 
         <div id="ctp-segments" style="overflow-y:auto; overflow-x:hidden;"></div>
 
         <div id="ctp-resize" title="Drag to resize the segment list"
              style="height:9px; cursor:ns-resize; display:flex; align-items:center; justify-content:center;
-                    border-top:1px solid #2c2c36; user-select:none;">
-          <span style="width:26px; height:2px; border-radius:1px; background:#4a4a58;"></span>
+                    border-top:1px solid ${THEME.borderMuted}; user-select:none;">
+          <span style="width:26px; height:2px; border-radius:1px; background:${THEME.controlBorder};"></span>
         </div>
 
         <div id="ctp-post-menu" style="display:none; padding:4px 8px 0;"></div>
 
         <div style="padding:7px 10px;">
           <button id="ctp-post" style="width:100%; padding:6px; border:none; border-radius:6px;
-                  background:#4b3fa0; color:#fff; cursor:pointer; font-size:11px;">
+                  background:${THEME.accent}; color:#fff; cursor:pointer; font-size:11px;">
             📊 Post report ▾
           </button>
         </div>
 
         <div id="ctp-toast" style="display:none; padding:6px 10px; font-size:11px;
-             background:#20202a; border-top:1px solid #3a3a46;"></div>
+             background:${THEME.sectionBg}; border-top:1px solid ${THEME.border};"></div>
 
         <input type="file" id="ctp-import-file" accept="application/json" style="display:none;">
       `;
@@ -1832,7 +1858,11 @@
         }
         #combat-timer-panel #ctp-segments::-webkit-scrollbar { width: 8px; }
         #combat-timer-panel #ctp-segments::-webkit-scrollbar-thumb {
-          background: #3a3a46; border-radius: 4px;
+          background: ${THEME.border}; border-radius: 4px;
+        }
+        #combat-timer-panel .ctp-chip {
+          cursor: pointer; padding: 2px 7px; border-radius: 5px;
+          font-size: 10px; white-space: nowrap;
         }
       `;
       document.head.appendChild(style);
@@ -1845,8 +1875,8 @@
       btn.textContent = "⚔️";
       btn.style.cssText = `
         position: fixed; left: 12px; top: 50%; transform: translateY(-50%); z-index: 9999;
-        width: 34px; height: 34px; border-radius: 50%; background: #2a2a35;
-        border: 1px solid #3a3a46; display:flex; align-items:center; justify-content:center;
+        width: 34px; height: 34px; border-radius: 50%; background: ${THEME.headerBg};
+        border: 1px solid ${THEME.border}; display:flex; align-items:center; justify-content:center;
         cursor:pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
       `;
       btn.addEventListener("click", () => openPanel());
@@ -1886,7 +1916,7 @@
       el.innerHTML = items.map((it) => `
         <div data-menu="${it.key}" data-hover style="cursor:pointer; padding:5px 7px; border-radius:5px;
              display:flex; justify-content:space-between; gap:8px; align-items:baseline;
-             ${it.danger ? "color:#e79a9a;" : ""}">
+             ${it.danger ? `color:${THEME.danger};` : ""}">
           <span>${it.label}</span>
           ${it.hint ? `<span style="opacity:0.45; font-size:10px;">${it.hint}</span>` : ""}
         </div>`).join("");
@@ -1923,7 +1953,7 @@
       el.innerHTML = tabs.map((t) => `
         <span data-session="${t.key}" ${selectedSession === t.key ? "" : "data-hover"}
           style="flex:1; text-align:center; padding:4px 2px; border-radius:5px; cursor:pointer;
-                 ${selectedSession === t.key ? "background:#4b3fa0;" : ""}
+                 ${selectedSession === t.key ? `background:${THEME.accent};` : ""}
                  opacity:${selectedSession === t.key ? "1" : (t.hasData ? "0.6" : "0.35")};">${t.label}</span>`).join("");
       el.querySelectorAll("[data-session]").forEach((node) => {
         node.addEventListener("click", () => {
@@ -1959,7 +1989,7 @@
       const where = combat
         ? `Round ${combat.round ?? "–"}${turnCount ? ` · turn ${(combat.turn ?? 0) + 1} of ${turnCount}` : ""}`
         : "No active combat";
-      const paused = game.paused ? ` <span style="color:#e8a33d;">⏸ paused</span>` : "";
+      const paused = game.paused ? ` <span style="color:${PAUSED_COLOR};">⏸ paused</span>` : "";
 
       let body = `<div style="font-size:11px; opacity:0.5; margin-top:6px;">Nothing is being tracked right now.</div>`;
       if (currentSegment) {
@@ -1974,7 +2004,7 @@
             </span>
             <span id="ctp-live-dur" style="font-variant-numeric:tabular-nums;">${formatDuration(Math.round(segMs(currentSegment) / 1000))}</span>
             <span id="ctp-split" data-hover title="Split the running segment right now"
-                  style="cursor:pointer; padding:4px 8px; border-radius:5px; border:1px solid #4a4a58; white-space:nowrap;">✂️ Split</span>
+                  style="cursor:pointer; padding:4px 8px; border-radius:5px; border:1px solid ${THEME.controlBorder}; white-space:nowrap;">✂️ Split</span>
           </div>`;
       }
 
@@ -2111,9 +2141,9 @@
     function renderFilters() {
       const el = panel.querySelector("#ctp-filters");
       el.innerHTML = `<span style="opacity:0.5;">Filter</span>` + SEG_FILTERS.map((f) => `
-        <span data-filter="${f.key}" ${segFilter === f.key ? "" : "data-hover"}
-          style="cursor:pointer; padding:2px 7px; border-radius:9px;
-                 ${segFilter === f.key ? "background:#4b3fa0;" : "border:1px solid #3f3f4c; opacity:0.6;"}">${f.label}</span>`).join("");
+        <span class="ctp-chip" data-filter="${f.key}" ${segFilter === f.key ? "" : "data-hover"}
+          style="border-radius:9px;
+                 ${segFilter === f.key ? `background:${THEME.accent};` : `border:1px solid ${THEME.chipBorder}; opacity:0.6;`}">${f.label}</span>`).join("");
       el.querySelectorAll("[data-filter]").forEach((node) => {
         node.addEventListener("click", () => {
           segFilter = node.dataset.filter;
@@ -2174,9 +2204,8 @@
 
     function categoryChipHTML(seg) {
       const meta = CATEGORY_META[seg.category] ?? CATEGORY_META.player;
-      return `<span data-cat-open="${seg.id}" title="Change category"
-        style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px; white-space:nowrap;
-               background:${meta.bg}; color:${meta.fg};">${meta.label} ▾</span>`;
+      return `<span class="ctp-chip" data-cat-open="${seg.id}" title="Change category"
+        style="background:${meta.bg}; color:${meta.fg};">${meta.label} ▾</span>`;
     }
 
     function categoryPickerHTML(seg) {
@@ -2188,22 +2217,19 @@
         .map(([key, meta]) => {
         const active = seg.category === key;
         const label = key === "player" ? `${meta.label}…` : meta.label;
-        return `<span data-seg-id="${seg.id}" data-cat="${key}" ${active ? "" : "data-hover"}
-          style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px;
-                 ${active ? `background:${meta.bg}; color:${meta.fg};` : "border:1px solid #3f3f4c;"}">${label}</span>`;
+        return `<span class="ctp-chip" data-seg-id="${seg.id}" data-cat="${key}" ${active ? "" : "data-hover"}
+          style="${active ? `background:${meta.bg}; color:${meta.fg};` : `border:1px solid ${THEME.chipBorder};`}">${label}</span>`;
       }).join("");
 
       let players = "";
       if (playerPickerSegId === seg.id) {
         const chips = getCombatPlayers().map((p) => `
-          <span data-seg-id="${seg.id}" data-owner-pick="${p.ownerId}"
-            style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px;
-                   background:${p.color}; color:${labelColorOn(p.color)};">${escapeHtml(p.name)}</span>`).join("");
+          <span class="ctp-chip" data-seg-id="${seg.id}" data-owner-pick="${p.ownerId}"
+            style="background:${p.color}; color:${labelColorOn(p.color)};">${escapeHtml(p.name)}</span>`).join("");
         players = `
           <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:5px;">
-            <span data-seg-id="${seg.id}" data-owner-pick="__default__" data-hover
-              style="cursor:pointer; padding:2px 7px; border-radius:5px; font-size:10px;
-                     border:1px dashed rgba(255,255,255,0.35); opacity:0.75;">↩ Default</span>
+            <span class="ctp-chip" data-seg-id="${seg.id}" data-owner-pick="__default__" data-hover
+              style="border:1px dashed rgba(255,255,255,0.35); opacity:0.75;">↩ Default</span>
             ${chips}
           </div>`;
       }
@@ -2575,7 +2601,7 @@
         { key: "players", label: "🧑 Player list — turn, gap, wait" },
       ];
       el.innerHTML = `
-        <div style="border:1px solid #3a3a46; border-radius:6px; overflow:hidden;">
+        <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
           ${options.map((o) => `
             <div data-post="${o.key}" data-hover style="cursor:pointer; padding:6px 8px; font-size:11px;">${o.label}</div>`).join("")}
         </div>
