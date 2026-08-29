@@ -593,6 +593,35 @@
     return { totalMs: ms, byEntity: [...byEntity.values()] };
   }
 
+  // Splits gmTotalStats()'s combined total into the two things it currently
+  // blends together under combatant-name keys: a genuinely unclaimed
+  // monster's own turn (byMonster, same per-combatantId shape gmTotalStats()
+  // already returns) vs. a technically-owned segment a human manually
+  // recategorized "gm" (manualMs, e.g. "this player's turn was really the
+  // GM's time, not theirs") - the same seg.ownerId == null distinction
+  // npcAggregate() already uses to tell "a monster's turn" from "a human
+  // override", just summed instead of counted into turns. Used by the GM
+  // Overhead chat report to show that manual overhead as its own slice
+  // instead of it silently appearing as if it were one more monster.
+  function gmOverheadStats(segs) {
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    let manualMs = 0;
+    const byMonster = new Map();
+    for (const seg of segs) {
+      if (!countsForGM(seg, lastLiveOwner)) continue;
+      const ms = segMs(seg);
+      if (seg.ownerId != null) {
+        manualMs += ms;
+        continue;
+      }
+      if (!byMonster.has(seg.combatantId)) {
+        byMonster.set(seg.combatantId, { combatantId: seg.combatantId, name: seg.combatantName, ms: 0 });
+      }
+      byMonster.get(seg.combatantId).ms += ms;
+    }
+    return { manualMs, byMonster: [...byMonster.values()] };
+  }
+
   // The GM's average "per turn" is defined per ROUND, not per individual
   // monster turn - round 1 is "combat start through the end of round 1",
   // round 2 is "end of round 1 through end of round 2", and so on. Unlike
@@ -1671,6 +1700,73 @@
         title: "🎉 Fun Facts",
         subtitle: `Total ${formatDuration(Math.round(sessionTotalMs(segs) / 1000))}`,
         body: hasAnyFact ? `<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:2px;">${tiles}</div>` : "",
+      });
+    }
+
+    // Splits the combined GM bar buildBarsContent() shows into what it's
+    // actually made of: genuinely unclaimed monster turns (gmOverheadStats()
+    // .byMonster, one slice per monster, same as gmTotalStats().byEntity
+    // normally renders), "Manual GM" (a technically-owned segment a human
+    // recategorized "gm" - previously invisible as its own category, shown
+    // under whichever combatant it came from instead), and "Setup"
+    // (categoryTotals()'s own GM-only category, folded in here rather than
+    // shown as its own separate bar). All three are shaded from the GM's own
+    // color via the same orderAndShade()/darkenHex() mechanism
+    // buildGmBarSegments() already uses - Setup/Manual GM are deliberately
+    // NOT given their own fixed colors here, unlike the main chart's
+    // standalone Setup bar, since this report's whole point is "all of it is
+    // GM overhead." Setup/Manual GM are placed ahead of the real monster
+    // entities in the array passed to capEntities()/orderAndShade(), so the
+    // monsters still anchor the bright/rightmost end and only the
+    // pseudo-entities (or the smallest monsters, past the cap) end up in the
+    // darkest/leftmost/merged positions.
+    function buildGmOverheadContent() {
+      const segs = allSegments();
+      const overhead = gmOverheadStats(segs);
+      const setupMs = categoryTotals(segs).setupMs;
+
+      const pseudo = [];
+      if (setupMs > 0) pseudo.push({ combatantId: "__setup__", name: "Setup", ms: setupMs });
+      if (overhead.manualMs > 0) pseudo.push({ combatantId: "__manual__", name: "Manual GM", ms: overhead.manualMs });
+      const entities = [...pseudo, ...overhead.byMonster];
+      const totalMs = entities.reduce((sum, e) => sum + e.ms, 0);
+
+      let body = "";
+      if (totalMs > 0) {
+        const gmColor = getCombatantColor(null);
+        const capped = capEntities(entities, (e) => e.ms, () => false);
+        const ordered = orderAndShade(capped, () => false).map(({ item, shade }) => ({ item, color: darkenHex(gmColor, shade) }));
+        const showLabels = ordered.length > 1;
+        const parts = ordered.map(({ item, color }) => ({
+          ms: item.ms,
+          color,
+          label: showLabels ? escapeHtml(item.name) : null,
+          labelPct: 28,
+          altLabel: showLabels ? formatDuration(Math.round(item.ms / 1000)) : null,
+          title: item.mergedNames ? item.mergedNames.join(", ") : `${item.name} · ${formatDuration(Math.round(item.ms / 1000))}`,
+        }));
+
+        // A textual breakdown alongside the bar - past a handful of monsters
+        // the bar alone is hard to read exactly, so the three buckets this
+        // report exists to separate get spelled out in percentages too.
+        const monstersMs = overhead.byMonster.reduce((sum, m) => sum + m.ms, 0);
+        const breakdown = [
+          setupMs > 0 ? `Setup ${pct(setupMs, totalMs)}%` : null,
+          overhead.manualMs > 0 ? `Manual GM ${pct(overhead.manualMs, totalMs)}%` : null,
+          monstersMs > 0 ? `Monsters ${pct(monstersMs, totalMs)}%` : null,
+        ].filter(Boolean).join(" · ");
+
+        body = `
+          <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
+            <div style="width:100%; height:100%; display:flex;">${proportionalSegmentsHtml(parts, 12)}</div>
+          </div>
+          <div style="font-size:10px; opacity:0.6; margin-top:6px; color:#eee !important;">${breakdown}</div>`;
+      }
+
+      return wrapCard({
+        title: "🎲 GM Overhead",
+        subtitle: `Total ${formatDuration(Math.round(totalMs / 1000))}`,
+        body,
       });
     }
 
@@ -3176,6 +3272,7 @@
         { key: "players", label: "🧑 Player list — turn, gap, wait" },
         { key: "rounds", label: "📈 Round pacing — time per round" },
         { key: "facts", label: "🎉 Fun facts — extremes for the session" },
+        { key: "gmoverhead", label: "🎲 GM overhead — monsters, setup, manual" },
       ];
       el.innerHTML = `
         <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
@@ -3188,7 +3285,10 @@
           const kind = node.dataset.post;
           postMenuOpen = false;
           renderPanel();
-          const builders = { bars: buildBarsContent, players: buildPlayerListContent, rounds: buildRoundPacingContent, facts: buildFunFactsContent };
+          const builders = {
+            bars: buildBarsContent, players: buildPlayerListContent, rounds: buildRoundPacingContent,
+            facts: buildFunFactsContent, gmoverhead: buildGmOverheadContent,
+          };
           await postToChat(builders[kind](), kind);
           toast("Posted to chat — only you can see it.");
         });
@@ -3243,7 +3343,7 @@
       lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
       buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
       absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats, roundPacingStats,
-      funFactsStats,
+      funFactsStats, gmOverheadStats,
     };
   }
 })();

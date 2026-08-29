@@ -12,7 +12,7 @@ const {
   lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
   buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
   absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
-  roundPacingStats, funFactsStats,
+  roundPacingStats, funFactsStats, gmOverheadStats,
 } = require("../foundry-combat-timer.user.js");
 
 // Minimal segment builder - only the fields a given test actually cares
@@ -116,6 +116,24 @@ test("countsForGM / gmTotalStats / gmRoundStats", () => {
   const rounds = gmRoundStats(segs);
   assert.equal(rounds.roundCount, 1);
   assert.equal(rounds.avgMs, 1010);
+});
+
+test("gmOverheadStats splits a genuinely unclaimed monster turn from a manual 'gm' recategorization of an owned segment", () => {
+  const segs = [
+    seg({ id: "mon", combatantId: "gob1", combatantName: "Goblin", ownerId: null, category: "gm", start: 0, end: 1000 }),
+    seg({ id: "manual", combatantId: "pc1", combatantName: "Hero", ownerId: "p1", category: "gm", start: 1000, end: 1300 }),
+  ];
+  const overhead = gmOverheadStats(segs);
+  assert.equal(overhead.manualMs, 300);
+  assert.equal(overhead.byMonster.length, 1);
+  assert.deepEqual(overhead.byMonster[0], { combatantId: "gob1", name: "Goblin", ms: 1000 });
+});
+
+test("gmOverheadStats: a claimed segment (real ownerId, not manually recategorized) contributes to neither bucket", () => {
+  const segs = [seg({ combatantId: "pc1", ownerId: "p1", category: "player", start: 0, end: 1000 })];
+  const overhead = gmOverheadStats(segs);
+  assert.equal(overhead.manualMs, 0);
+  assert.equal(overhead.byMonster.length, 0);
 });
 
 test("gmRoundStats counts a quiet round (no GM time) in the denominator", () => {
