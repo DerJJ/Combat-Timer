@@ -916,13 +916,19 @@
     // is left behind.
     function enforceArchiveCap() {
       const cap = Math.max(1, ui.maxArchivedSessions);
+      const evictedSessions = [];
       while (archiveManifest.length > cap) {
         const evicted = archiveManifest.pop();
         localStorage.removeItem(archivedSessionKey(evicted.id));
         invalidateViewedArchive(evicted.id);
         if (selectedSession === evicted.id) selectedSession = "current";
         manifestDirty = true;
-        toast(`Archived session limit (${cap}) reached - oldest session (${formatArchiveLabel(evicted.startedAt)}) removed.`);
+        evictedSessions.push(evicted);
+      }
+      if (evictedSessions.length === 1) {
+        toast(`Archived session limit (${cap}) reached - oldest session (${formatArchiveLabel(evictedSessions[0].startedAt)}) removed.`);
+      } else if (evictedSessions.length > 1) {
+        toast(`Archived session limit (${cap}) reached - removed ${evictedSessions.length} older sessions.`);
       }
     }
 
