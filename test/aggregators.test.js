@@ -12,7 +12,7 @@ const {
   lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
   buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
   absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
-  roundPacingStats,
+  roundPacingStats, funFactsStats,
 } = require("../foundry-combat-timer.user.js");
 
 // Minimal segment builder - only the fields a given test actually cares
@@ -205,6 +205,45 @@ test("roundPacingStats skips segments with no round recorded, and a manual 'gm' 
   assert.equal(rounds.length, 1); // the no-round segment contributes nothing
   assert.equal(rounds[0].byKey.get("gm"), 500); // effectiveOwner() is null for a manual "gm" override -> countsForGM() bucket, not p1
   assert.equal(rounds[0].byKey.has("p1"), false);
+});
+
+test("funFactsStats: longest/shortest turn, slowest average, and longest wait come from the players' own turn slots", () => {
+  const facts = funFactsStats(twoRoundScenario());
+  assert.deepEqual(facts.longestTurn, { ownerId: "p1", ms: 1500 }); // t3
+  assert.deepEqual(facts.shortestTurn, { ownerId: "p1", ms: 1000 }); // t1
+  assert.equal(facts.slowestAvg.ownerId, "p1");
+  assert.equal(facts.slowestAvg.avgMs, 1250); // same figure turnWindowStats()'s own test documents for this scenario
+  assert.equal(facts.longestWait.ownerId, "p1");
+  assert.equal(facts.longestWait.ms, 1000); // matches absoluteWaitStats()'s own test for this scenario
+  assert.equal(facts.avgWaitMs, 1000); // only one player this session
+  assert.equal(facts.quickestReaction, null); // gob1's turn (t2) is unclaimed - no out-of-turn credit anywhere here
+  assert.equal(facts.mostReactions, null);
+});
+
+// A monster's turn with three sub-segments reassigned to two different
+// players (genuine out-of-turn "reactions"), plus a defeated NPC's
+// instant-skip redirected from its own earlier (non-defeated) turn - which
+// must NOT count as a reaction despite technically being out-of-turn credit.
+function reactionScenario() {
+  return [
+    seg({ id: "p1-turn", combatantId: "pc1", ownerId: "p1", category: "player", trigger: "turn", start: 0, end: 1000, round: 1 }),
+    seg({ id: "mon-open", combatantId: "gob1", ownerId: null, category: "gm", trigger: "turn", start: 1000, end: 1100, round: 1 }),
+    seg({ id: "reaction-p2-a", combatantId: "pc2", ownerId: null, overrideOwnerId: "p2", category: "player", trigger: "pause", start: 1100, end: 1150, round: 1 }), // 50ms
+    seg({ id: "reaction-p2-b", combatantId: "pc2", ownerId: null, overrideOwnerId: "p2", category: "player", trigger: "unpause", start: 1150, end: 1170, round: 1 }), // 20ms - quickest
+    seg({ id: "reaction-p3", combatantId: "pc3", ownerId: null, overrideOwnerId: "p3", category: "player", trigger: "pause", start: 1170, end: 1250, round: 1 }), // 80ms
+    // gob2's own (non-defeated) turn, manually handed to p1 in full - also a genuine reaction.
+    seg({ id: "gob2-real", combatantId: "gob2", ownerId: null, overrideOwnerId: "p1", category: "player", trigger: "turn", start: 1250, end: 1300, round: 1, defeated: false, actorType: "npc" }), // 50ms
+    // gob2 dies; its instant-skip redirects to p1 (its last real owner) via effectiveOwner(), but isRealTurn() excludes it from ever counting as a reaction.
+    seg({ id: "gob2-skip", combatantId: "gob2", ownerId: null, overrideOwnerId: null, category: "gm", trigger: "turn", start: 1300, end: 1301, round: 1, defeated: true, actorType: "npc" }),
+  ];
+}
+
+test("funFactsStats: quickest/most reactions count genuine out-of-turn credit, excluding a defeated NPC's instant-skip", () => {
+  const facts = funFactsStats(reactionScenario());
+  assert.equal(facts.quickestReaction.ownerId, "p2");
+  assert.equal(facts.quickestReaction.ms, 20);
+  assert.equal(facts.mostReactions.ownerId, "p2");
+  assert.equal(facts.mostReactions.count, 2); // p1 and p3 each have exactly 1 - the instant-skip does not bump p1 to 2
 });
 
 test("session comparison: the same aggregator applied to two independent sessions never mixes their data", () => {
