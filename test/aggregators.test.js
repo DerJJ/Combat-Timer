@@ -12,7 +12,7 @@ const {
   lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
   buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
   absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats,
-  roundPacingStats, funFactsStats, gmOverheadStats,
+  roundPacingStats, funFactsStats, gmOverheadStats, bucketTimeByOwner, sessionCompareStats,
 } = require("../foundry-combat-timer.user.js");
 
 // Minimal segment builder - only the fields a given test actually cares
@@ -223,6 +223,35 @@ test("roundPacingStats skips segments with no round recorded, and a manual 'gm' 
   assert.equal(rounds.length, 1); // the no-round segment contributes nothing
   assert.equal(rounds[0].byKey.get("gm"), 500); // effectiveOwner() is null for a manual "gm" override -> countsForGM() bucket, not p1
   assert.equal(rounds[0].byKey.has("p1"), false);
+});
+
+test("bucketTimeByOwner buckets by owner and the gm/team/setup sentinel keys", () => {
+  const segs = [
+    seg({ id: "p", combatantId: "pc1", ownerId: "p1", category: "player", start: 0, end: 1000 }),
+    seg({ id: "g", combatantId: "gob1", ownerId: null, category: "gm", start: 1000, end: 1500 }),
+    seg({ id: "t", combatantId: null, ownerId: null, category: "team", start: 1500, end: 1800 }),
+    seg({ id: "s", combatantId: null, ownerId: null, category: "setup", start: 1800, end: 1900 }),
+  ];
+  const bucket = bucketTimeByOwner(segs, lastLiveOwnerByCombatant(segs));
+  assert.equal(bucket.get("p1"), 1000);
+  assert.equal(bucket.get("gm"), 500);
+  assert.equal(bucket.get("team"), 300);
+  assert.equal(bucket.get("setup"), 100);
+});
+
+test("sessionCompareStats: totalMs and byKey are computed independently per session", () => {
+  const sessionA = twoRoundScenario(); // p1: 2500ms across two turns; gob1: 1000ms unclaimed
+  const sessionB = [
+    seg({ id: "u1", combatantId: "pc2", ownerId: "p2", category: "player", trigger: "turn", start: 0, end: 5000, round: 1 }),
+  ];
+  const stats = sessionCompareStats([{ id: "a", segs: sessionA }, { id: "b", segs: sessionB }]);
+  assert.equal(stats[0].id, "a");
+  assert.equal(stats[0].totalMs, sessionTotalMs(sessionA));
+  assert.equal(stats[0].byKey.get("p1"), 2500);
+  assert.equal(stats[0].byKey.get("gm"), 1000);
+  assert.equal(stats[1].id, "b");
+  assert.equal(stats[1].totalMs, 5000);
+  assert.equal(stats[1].byKey.get("p2"), 5000);
 });
 
 test("funFactsStats: longest/shortest turn, slowest average, and longest wait come from the players' own turn slots", () => {

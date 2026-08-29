@@ -645,24 +645,19 @@
     return { roundCount: rounds.size, avgMs: rounds.size ? ms / rounds.size : 0 };
   }
 
-  // Buckets every round's tracked time by who it belongs to, for the
-  // round-pacing chat report - same ownership rules summaryEntries() uses
-  // for the main chart (player/GM via countsForGM()/effectiveOwner(), plus
-  // Team/Setup as their own buckets), just partitioned per round instead of
-  // summed across the whole session. Segments with no round (round == null)
-  // are skipped - there's no round to attribute them to - so a round made
-  // up entirely of such segments produces no entry at all, same as it stays
-  // invisible to gmRoundStats()'s round count. Returns ascending by round
-  // number; each round's bucket is keyed by ownerId, or the sentinel
-  // "gm"/"team"/"setup" - a real Foundry user id never collides with those.
-  // Kept ownerId-only (no name/color) so this stays a pure, game.users-free
-  // function; init() resolves display info the same way summaryEntries()
-  // already does for perCombatantStats()/gmTotalStats().
-  function roundPacingStats(segs) {
-    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
-    const rounds = new Map(); // round number -> Map(bucketKey -> ms)
+  // Buckets one set of segments' tracked time by who it belongs to - same
+  // ownership rules summaryEntries() uses for the main chart (player/GM via
+  // countsForGM()/effectiveOwner(), plus Team/Setup as their own buckets).
+  // lastLiveOwner is passed in rather than recomputed here so a caller that
+  // wants "last real owner" resolved across a larger span than the segments
+  // being bucketed (e.g. one round's segments, resolved against the whole
+  // session's history) can do so - see roundPacingStats() below. Keyed by
+  // ownerId, or the sentinel "gm"/"team"/"setup" - a real Foundry user id
+  // never collides with those. Shared by roundPacingStats() (one call per
+  // round) and sessionCompareStats() (one call per whole session).
+  function bucketTimeByOwner(segs, lastLiveOwner) {
+    const bucket = new Map();
     for (const seg of segs) {
-      if (seg.round == null) continue;
       let key = null;
       if (seg.category === "team") key = "team";
       else if (seg.category === "setup") key = "setup";
@@ -671,11 +666,46 @@
         key = effectiveOwner(seg, lastLiveOwner); // claimed -> perCombatantStats()'s scope; null here can't happen (countsForGM() above already caught the unclaimed case)
       }
       if (key === null) continue;
-      if (!rounds.has(seg.round)) rounds.set(seg.round, new Map());
-      const bucket = rounds.get(seg.round);
       bucket.set(key, (bucket.get(key) ?? 0) + segMs(seg));
     }
-    return [...rounds.entries()].sort((a, b) => a[0] - b[0]).map(([round, byKey]) => ({ round, byKey }));
+    return bucket;
+  }
+
+  // Partitions a session's segments into rounds and buckets each round's
+  // time via bucketTimeByOwner(), for the round-pacing chat report.
+  // Segments with no round (round == null) are skipped - there's no round
+  // to attribute them to - so a round made up entirely of such segments
+  // produces no entry at all, same as it stays invisible to gmRoundStats()'s
+  // round count. Returns ascending by round number. Kept ownerId-only (no
+  // name/color) so this stays a pure, game.users-free function; init()
+  // resolves display info the same way summaryEntries() already does for
+  // perCombatantStats()/gmTotalStats().
+  function roundPacingStats(segs) {
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    const roundSegs = new Map(); // round number -> segs[]
+    for (const seg of segs) {
+      if (seg.round == null) continue;
+      if (!roundSegs.has(seg.round)) roundSegs.set(seg.round, []);
+      roundSegs.get(seg.round).push(seg);
+    }
+    return [...roundSegs.entries()].sort((a, b) => a[0] - b[0])
+      .map(([round, segsInRound]) => ({ round, byKey: bucketTimeByOwner(segsInRound, lastLiveOwner) }));
+  }
+
+  // One session's total plus its bucketTimeByOwner() breakdown, for the
+  // "recent combats" comparison chat report - each session's lastLiveOwner
+  // is resolved from its own segments only, since sessions are independent
+  // (unlike a round, which is resolved against its whole session's
+  // history). totalMs comes from sessionTotalMs() itself, not the sum of
+  // the bucketed time, so it matches what every other report already calls
+  // "this session's total" even if some segment falls outside every bucket
+  // (no combatant, not team/setup either).
+  function sessionCompareStats(sessions) {
+    return sessions.map(({ id, segs }) => ({
+      id,
+      totalMs: sessionTotalMs(segs),
+      byKey: bucketTimeByOwner(segs, lastLiveOwnerByCombatant(segs)),
+    }));
   }
 
   function waitForFoundryReady(cb) {
@@ -1570,21 +1600,71 @@
       });
     }
 
-    // "+N more" merged color for a round with more contributors than
-    // capEntities()'s cap. Unlike buildPlayerBarRows()/buildGmBarSegments()
-    // (shades of ONE owner's own color), a round's segments are genuinely
-    // different people with their own distinct colors already - so the
-    // merged slice gets its own fixed, category-independent grey instead of
-    // a shade derived from any one of them.
-    const ROUND_MERGED_COLOR = "#54545f";
+    // "+N more" merged color for a bucketTimeByOwner() breakdown with more
+    // contributors than capEntities()'s cap. Unlike buildPlayerBarRows()/
+    // buildGmBarSegments() (shades of ONE owner's own color), these buckets
+    // are genuinely different people/categories with their own distinct
+    // colors already - so the merged slice gets its own fixed,
+    // owner-independent grey instead of a shade derived from any one of
+    // them. Shared by buildRoundPacingContent() and
+    // buildRecentComparisonContent() - the two reports that decompose a bar
+    // by bucketTimeByOwner() key rather than by one owner's own entities.
+    const OWNER_MERGED_COLOR = "#54545f";
 
-    // One row per round, each a bar stacked with that round's contributors
-    // in their own real colors (not shaded - see ROUND_MERGED_COLOR above),
-    // sized relative to the longest round so a bar that bogs down visibly
-    // reads longer than a quick one. Built on roundPacingStats() (which only
-    // knows ownerIds/sentinel keys) the same way summaryEntries() builds on
-    // perCombatantStats()/gmTotalStats()/categoryTotals() - this is where
-    // those keys become display names/colors via game.users.
+    // Resolves a bucketTimeByOwner() key into a display name/color - shared
+    // by buildRoundPacingContent() and buildRecentComparisonContent(). This
+    // is where those keys (ownerId, or the "gm"/"team"/"setup" sentinels)
+    // become display info via game.users, the same resolution
+    // summaryEntries() does for perCombatantStats()/gmTotalStats().
+    function ownerKeyDisplay(key) {
+      if (key === "team") return { name: "Team", color: TEAM_COLOR };
+      if (key === "setup") return { name: "Setup", color: SETUP_COLOR };
+      if (key === "gm") return { name: "GM", color: getCombatantColor(null) };
+      return { name: ownerName(key), color: getCombatantColor(key) };
+    }
+
+    // Turns a bucketTimeByOwner() Map into proportionalSegmentsHtml() parts,
+    // each bucket keeping its own real color (not shaded, per
+    // OWNER_MERGED_COLOR above) and capped past MAX_BAR_ENTITIES into a
+    // merged "+N more" slice.
+    function ownerBucketParts(byKey) {
+      const items = [...byKey.entries()].map(([key, ms]) => ({ ms, ...ownerKeyDisplay(key) })).sort((a, b) => b.ms - a.ms);
+      // isPrimary anchors on the largest contributor (items[0], since items
+      // is sorted by ms descending) - capEntities() otherwise anchors on the
+      // LAST array element when nothing matches isPrimary (the right choice
+      // for buildGmBarSegments()'s turn-ordered, unsorted input, but here it
+      // would keep the smallest contributor untouched while merging away
+      // some of the largest ones instead).
+      const capped = capEntities(items, (it) => it.ms, (it) => it === items[0]);
+      return capped.map((it) => ({
+        ms: it.ms,
+        color: it.combatantId === "__more__" ? OWNER_MERGED_COLOR : it.color,
+        label: escapeHtml(it.name),
+        labelPct: 28,
+        altLabel: formatDuration(Math.round(it.ms / 1000)),
+        title: it.mergedNames ? it.mergedNames.join(", ") : `${it.name} · ${formatDuration(Math.round(it.ms / 1000))}`,
+      }));
+    }
+
+    // One labelled, proportionally-scaled bar row - shared by
+    // buildRoundPacingContent() (one row per round) and
+    // buildRecentComparisonContent() (one row per session).
+    function ownerBucketBarRow(label, ms, byKey, pctOfMax) {
+      return `
+        <div style="margin:6px 0;">
+          <div style="display:flex; justify-content:space-between; gap:6px; font-size:11px; margin-bottom:2px; color:#eee !important;">
+            <span style="color:#eee !important;">${label}</span>
+            <span style="opacity:0.85; color:#eee !important;">${formatDuration(Math.round(ms / 1000))}</span>
+          </div>
+          <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
+            <div style="width:${pctOfMax}%; height:100%; display:flex;">${proportionalSegmentsHtml(ownerBucketParts(byKey), 12)}</div>
+          </div>
+        </div>`;
+    }
+
+    // One row per round, sized relative to the longest round so a bar that
+    // bogs down visibly reads longer than a quick one. Built on
+    // roundPacingStats() via the shared ownerBucket* helpers above.
     function buildRoundPacingContent() {
       const segs = allSegments();
       const rounds = roundPacingStats(segs);
@@ -1592,40 +1672,8 @@
       const max = Math.max(1, ...roundTotals);
 
       const rows = rounds.map(({ round, byKey }, i) => {
-        const items = [...byKey.entries()].map(([key, ms]) => {
-          if (key === "team") return { ms, name: "Team", color: TEAM_COLOR };
-          if (key === "setup") return { ms, name: "Setup", color: SETUP_COLOR };
-          if (key === "gm") return { ms, name: "GM", color: getCombatantColor(null) };
-          return { ms, name: ownerName(key), color: getCombatantColor(key) };
-        }).sort((a, b) => b.ms - a.ms);
-
-        // isPrimary anchors on the largest contributor (items[0], since
-        // items is sorted by ms descending) - capEntities() otherwise
-        // anchors on the LAST array element when nothing matches isPrimary
-        // (the right choice for buildGmBarSegments()'s turn-ordered,
-        // unsorted input, but here it would keep the smallest contributor
-        // untouched while merging away some of the largest ones instead).
-        const capped = capEntities(items, (it) => it.ms, (it) => it === items[0]);
-        const parts = capped.map((it) => ({
-          ms: it.ms,
-          color: it.combatantId === "__more__" ? ROUND_MERGED_COLOR : it.color,
-          label: escapeHtml(it.name),
-          labelPct: 28,
-          altLabel: formatDuration(Math.round(it.ms / 1000)),
-          title: it.mergedNames ? it.mergedNames.join(", ") : `${it.name} · ${formatDuration(Math.round(it.ms / 1000))}`,
-        }));
-
-        const pct = Math.max(4, Math.round((roundTotals[i] / max) * 100));
-        return `
-          <div style="margin:6px 0;">
-            <div style="display:flex; justify-content:space-between; gap:6px; font-size:11px; margin-bottom:2px; color:#eee !important;">
-              <span style="color:#eee !important;">🔄 Round ${round}</span>
-              <span style="opacity:0.85; color:#eee !important;">${formatDuration(Math.round(roundTotals[i] / 1000))}</span>
-            </div>
-            <div style="background:rgba(255,255,255,0.08) !important; border-radius:4px; height:9px; overflow:hidden;">
-              <div style="width:${pct}%; height:100%; display:flex;">${proportionalSegmentsHtml(parts, 12)}</div>
-            </div>
-          </div>`;
+        const pctOfMax = Math.max(4, Math.round((roundTotals[i] / max) * 100));
+        return ownerBucketBarRow(`🔄 Round ${round}`, roundTotals[i], byKey, pctOfMax);
       }).join("");
 
       return wrapCard({
@@ -1767,6 +1815,54 @@
         title: "🎲 GM Overhead",
         subtitle: `Total ${formatDuration(Math.round(totalMs / 1000))}`,
         body,
+      });
+    }
+
+    // "Tonight" (the live session, regardless of what's selected in the
+    // panel) plus the n-1 most recently archived sessions - archiveManifest
+    // is already newest-first, so this is just its first n-1 entries.
+    // Loads each archived session's segments via loadArchivedSessionSegments()
+    // directly rather than through the single-entry viewedArchive cache,
+    // since this needs several sessions' data alive at once.
+    function recentSessionsForCompare(n) {
+      const list = [{ id: "current", label: "Tonight", segs: currentSegment ? [...segments, currentSegment] : segments }];
+      for (const entry of archiveManifest.slice(0, n - 1)) {
+        list.push({ id: entry.id, label: formatArchiveLabel(entry.startedAt), segs: loadArchivedSessionSegments(entry.id) });
+      }
+      return list;
+    }
+
+    // One row per session (most recent first, same order recentSessionsForCompare()
+    // already returns), sized relative to the longest so a heavier night
+    // stands out at a glance - same ownerBucket* rendering buildRoundPacingContent()
+    // uses, just at session granularity instead of round granularity. A
+    // short headline compares tonight's total against the average of
+    // whichever other sessions are in the window.
+    function buildRecentComparisonContent(n) {
+      const sessionsInput = recentSessionsForCompare(n);
+      const stats = sessionCompareStats(sessionsInput);
+      const labelById = new Map(sessionsInput.map((s) => [s.id, s.label]));
+      const max = Math.max(1, ...stats.map((s) => s.totalMs));
+
+      const rows = stats.map((s) => {
+        const pctOfMax = Math.max(4, Math.round((s.totalMs / max) * 100));
+        return ownerBucketBarRow(escapeHtml(labelById.get(s.id)), s.totalMs, s.byKey, pctOfMax);
+      }).join("");
+
+      let headline = "";
+      const tonight = stats.find((s) => s.id === "current");
+      const rest = stats.filter((s) => s.id !== "current");
+      if (tonight && rest.length) {
+        const restAvgMs = rest.reduce((sum, s) => sum + s.totalMs, 0) / rest.length;
+        const diffPct = restAvgMs > 0 ? Math.round(((tonight.totalMs - restAvgMs) / restAvgMs) * 100) : 0;
+        const arrow = diffPct > 0 ? "▲" : diffPct < 0 ? "▼" : "▬";
+        headline = `<div style="font-size:10px; opacity:0.6; margin-top:6px; color:#eee !important;">Tonight ${arrow} ${Math.abs(diffPct)}% vs. avg of the other ${rest.length}</div>`;
+      }
+
+      return wrapCard({
+        title: "🔀 Recent Combats",
+        subtitle: `${stats.length} session${stats.length === 1 ? "" : "s"}`,
+        body: rows + headline,
       });
     }
 
@@ -2044,6 +2140,7 @@
     let openCatSegId = null;            // which segment has its category picker open
     let menuOpen = false;               // the ⋯ overflow menu
     let postMenuOpen = false;           // the "Post report" dropdown
+    let recentComparePicking = false;   // post-menu is showing the "how many sessions" picker instead of the report list
     let archivePickerOpen = false;      // the "Archived" session list
     let settingsPickerOpen = false;     // the tracking-thresholds settings section
     let importUndo = null;              // one-level undo snapshot taken right before an import
@@ -3263,26 +3360,82 @@
       });
     }
 
+    // The "Recent combats" report needs a second step (how many sessions to
+    // compare) before it can post, unlike every other report which posts
+    // straight from the main list - see renderRecentComparePicker() below.
+    // Only fixed window sizes STRICTLY LESS than what's actually reachable
+    // are offered (archiveManifest.length archived + "Tonight"), with "all"
+    // always covering the rest - e.g. 8 archived + tonight = 9 reachable ->
+    // offer {2, 5, all}, never "10" (unreachable) or a redundant "9" AND
+    // "all" both meaning the same thing.
+    function reachableCompareWindows() {
+      const total = archiveManifest.length + 1;
+      return { total, windows: [2, 5, 10].filter((n) => n < total) };
+    }
+
+    function renderRecentComparePicker(el) {
+      const { total, windows } = reachableCompareWindows();
+      const options = [...windows, total]; // "all" always included, as the literal reachable total
+      el.innerHTML = `
+        <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
+          ${options.map((n) => `
+            <div data-compare-window="${n}" data-hover style="cursor:pointer; padding:6px 8px; font-size:11px; text-align:center;">
+              ${n === total ? `All (${total})` : `Last ${n}`}
+            </div>`).join("")}
+        </div>
+        <div style="font-size:10px; opacity:0.45; margin:4px 2px 0;">Tonight plus your most recently archived sessions.</div>`;
+      el.querySelectorAll("[data-compare-window]").forEach((node) => {
+        node.addEventListener("click", async () => {
+          const n = Number(node.dataset.compareWindow);
+          postMenuOpen = false;
+          recentComparePicking = false;
+          renderPanel();
+          await postToChat(buildRecentComparisonContent(n), "recent");
+          toast("Posted to chat — only you can see it.");
+        });
+      });
+    }
+
     function renderPostMenu() {
       const el = panel.querySelector("#ctp-post-menu");
       el.style.display = postMenuOpen ? "block" : "none";
-      if (!postMenuOpen) return;
+      if (!postMenuOpen) {
+        recentComparePicking = false; // stale sub-view never lingers into the next time the menu opens
+        return;
+      }
+      if (recentComparePicking) {
+        renderRecentComparePicker(el);
+        return;
+      }
+      const canCompare = archiveManifest.length > 0;
       const options = [
         { key: "bars", label: "📊 Bar chart — time per person" },
         { key: "players", label: "🧑 Player list — turn, gap, wait" },
         { key: "rounds", label: "📈 Round pacing — time per round" },
         { key: "facts", label: "🎉 Fun facts — extremes for the session" },
         { key: "gmoverhead", label: "🎲 GM overhead — monsters, setup, manual" },
+        { key: "recent", label: "🔀 Recent combats — compare sessions", disabled: !canCompare, hint: canCompare ? null : "needs an archived session" },
       ];
       el.innerHTML = `
         <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
           ${options.map((o) => `
-            <div data-post="${o.key}" data-hover style="cursor:pointer; padding:6px 8px; font-size:11px;">${o.label}</div>`).join("")}
+            <div data-post="${o.key}" ${o.disabled ? "" : "data-hover"} style="padding:6px 8px; font-size:11px;
+                 display:flex; justify-content:space-between; gap:8px; align-items:baseline;
+                 ${o.disabled ? "opacity:0.35; cursor:default;" : "cursor:pointer;"}">
+              <span>${o.label}</span>
+              ${o.hint ? `<span style="opacity:0.7; font-size:10px;">${o.hint}</span>` : ""}
+            </div>`).join("")}
         </div>
         <div style="font-size:10px; opacity:0.45; margin:4px 2px 0;">Whispered to you. Right-click the message → “Reveal to Everyone” to share.</div>`;
       el.querySelectorAll("[data-post]").forEach((node) => {
         node.addEventListener("click", async () => {
           const kind = node.dataset.post;
+          if (kind === "recent") {
+            if (!canCompare) return;
+            recentComparePicking = true;
+            renderPanel();
+            return;
+          }
           postMenuOpen = false;
           renderPanel();
           const builders = {
@@ -3343,7 +3496,7 @@
       lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
       buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
       absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats, roundPacingStats,
-      funFactsStats, gmOverheadStats,
+      funFactsStats, gmOverheadStats, bucketTimeByOwner, sessionCompareStats,
     };
   }
 })();
