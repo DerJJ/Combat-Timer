@@ -1682,6 +1682,10 @@
       return `ctp-ui-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
     }
     const UI_DEFAULTS = { left: null, top: 60, panelWidth: 300, segHeight: 240, summaryOpen: false, maxArchivedSessions: 10 };
+    // Past this, each further +5 step needs an explicit confirm - each
+    // archived session is its own localStorage key, so a very high cap
+    // quietly grows browser storage usage with no other warning.
+    const ARCHIVE_CAP_CONFIRM_THRESHOLD = 20;
     let ui = { ...UI_DEFAULTS };
     try {
       const savedUi = JSON.parse(localStorage.getItem(uiStorageKey()) ?? "null");
@@ -2229,15 +2233,23 @@
           renderPanel();
         });
       });
+      const applyArchiveCap = (newCap) => {
+        ui.maxArchivedSessions = newCap;
+        persistUi();
+        enforceArchiveCap(); // lowering the cap evicts excess immediately, not just on the next archive
+        persist();
+        renderPanel();
+      };
       el.querySelectorAll("[data-archive-cap]").forEach((node) => {
         node.addEventListener("click", (ev) => {
           ev.stopPropagation();
           const delta = Number(node.dataset.archiveCap);
-          ui.maxArchivedSessions = Math.max(1, ui.maxArchivedSessions + delta);
-          persistUi();
-          enforceArchiveCap(); // lowering the cap evicts excess immediately, not just on the next archive
-          persist();
-          renderPanel();
+          const newCap = Math.max(1, ui.maxArchivedSessions + delta);
+          if (delta > 0 && newCap > ARCHIVE_CAP_CONFIRM_THRESHOLD) {
+            confirmBar(`Keep ${newCap} archived sessions? Each one is its own browser-storage entry - large numbers use more storage.`, "Keep", () => applyArchiveCap(newCap));
+          } else {
+            applyArchiveCap(newCap);
+          }
         });
       });
     }
