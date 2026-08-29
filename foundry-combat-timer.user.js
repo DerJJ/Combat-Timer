@@ -476,6 +476,73 @@
     return result;
   }
 
+  // Six single-fact "extremes" for the fun-facts chat report. Each field is
+  // null when there's no qualifying data yet (e.g. no out-of-turn segments
+  // this session), so buildFunFactsContent() can render a "not enough data"
+  // tile per fact instead of working off a bogus 0/Infinity value.
+  //
+  // Longest/shortest turn come from ownTurnSlotsByOwner()'s own real
+  // turn-opening slots - the same set perCombatantStats()'s turnCount and
+  // betweenTurnStats()/turnWindowStats() already use. "Slowest on average"
+  // reuses turnWindowStats()'s per-player Ø turn length directly - the same
+  // number already shown as "Ø .../round" on the main chart, so this can
+  // never disagree with it. "Longest wait" (plus the session average, for
+  // scale) comes straight from absoluteWaitStats().
+  //
+  // Quickest reaction / most reactions need a dedicated pass: a "reaction"
+  // here means a genuine out-of-turn credit (an Attack of Opportunity, or
+  // any other manual reassignment away from the slot's designated owner) -
+  // isRealTurn() excludes a defeated NPC's near-instant skip from counting,
+  // even though its redirected time is also technically "out-of-turn"
+  // credit, because an instant-skip's ~0ms duration would otherwise win
+  // "quickest reaction" every single time and say nothing real about anyone
+  // actually reacting quickly.
+  function funFactsStats(segs) {
+    const { byOwner } = ownTurnSlotsByOwner(segs);
+    let longestTurn = null, shortestTurn = null;
+    for (const [ownerId, list] of byOwner) {
+      for (const slot of list) {
+        const ms = slot.end - slot.start;
+        if (!longestTurn || ms > longestTurn.ms) longestTurn = { ownerId, ms };
+        if (!shortestTurn || ms < shortestTurn.ms) shortestTurn = { ownerId, ms };
+      }
+    }
+
+    let slowestAvg = null;
+    for (const [ownerId, tw] of turnWindowStats(segs)) {
+      if (!tw.windows.length) continue;
+      if (!slowestAvg || tw.avgMs > slowestAvg.avgMs) slowestAvg = { ownerId, avgMs: tw.avgMs };
+    }
+
+    let longestWait = null, waitSum = 0, waitCount = 0;
+    for (const [ownerId, ms] of absoluteWaitStats(segs)) {
+      waitSum += ms;
+      waitCount += 1;
+      if (!longestWait || ms > longestWait.ms) longestWait = { ownerId, ms };
+    }
+    const avgWaitMs = waitCount ? waitSum / waitCount : 0;
+
+    const lastLiveOwner = lastLiveOwnerByCombatant(segs);
+    let quickestReaction = null;
+    const reactionCounts = new Map();
+    for (const slot of buildTurnSlots(segs)) {
+      for (const seg of slot.segments) {
+        if ((seg.category !== "player" && seg.category !== "gm") || !hasCombatContext(seg) || !isRealTurn(seg)) continue;
+        const owner = effectiveOwner(seg, lastLiveOwner);
+        if (!owner || owner === slot.designatedOwner) continue; // unclaimed, or this IS their own designated turn
+        const ms = segMs(seg);
+        if (!quickestReaction || ms < quickestReaction.ms) quickestReaction = { ownerId: owner, ms };
+        reactionCounts.set(owner, (reactionCounts.get(owner) ?? 0) + 1);
+      }
+    }
+    let mostReactions = null;
+    for (const [ownerId, count] of reactionCounts) {
+      if (!mostReactions || count > mostReactions.count) mostReactions = { ownerId, count };
+    }
+
+    return { longestTurn, shortestTurn, slowestAvg, longestWait, avgWaitMs, quickestReaction, mostReactions };
+  }
+
   // Wall-clock span of the whole session: first segment start to last
   // segment end (or now, if still running) - "how long did this take overall".
   function sessionTotalMs(segs) {
@@ -1536,6 +1603,74 @@
         title: "📈 Round Pacing",
         subtitle: rounds.length ? `${rounds.length} round${rounds.length === 1 ? "" : "s"}` : "",
         body: rows,
+      });
+    }
+
+    // Six single-fact tiles built on funFactsStats() (which only knows
+    // ownerIds) - this is where each fact's ownerId becomes a display
+    // name/color via ownerName()/getCombatantColor(), the same resolution
+    // summaryEntries() does for the main chart. A fact with no qualifying
+    // data (e.g. no out-of-turn segments yet) renders as a muted "–" tile
+    // instead of being silently dropped, so the six-tile layout stays fixed
+    // regardless of what's actually happened this session.
+    function buildFunFactsContent() {
+      const segs = allSegments();
+      const facts = funFactsStats(segs);
+      // Every fact here always resolves to a real player owner - each comes
+      // from an aggregator (ownTurnSlotsByOwner()/turnWindowStats()/
+      // absoluteWaitStats()/effectiveOwner()) that already filters out the
+      // null/GM case before the fact is ever recorded.
+      const person = (ownerId) => ({ name: ownerName(ownerId), color: getCombatantColor(ownerId) });
+
+      const tile = (icon, label, fact, valueHtml) => `
+        <div style="background:rgba(255,255,255,0.05) !important; border-radius:6px; padding:6px 8px;">
+          <div style="font-size:9px; opacity:0.55; color:#eee !important;">${icon} ${label}</div>
+          ${fact ? valueHtml(fact) : `<div style="opacity:0.4; font-size:11px; color:#eee !important;">Not enough data yet</div>`}
+        </div>`;
+
+      const nameValueHtml = (name, color, valueLine, extraLine = "") => `
+        <div style="display:flex; align-items:center; gap:5px; min-width:0;">
+          <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:${color} !important; flex-shrink:0;"></span>
+          <span title="${escapeHtml(name)}" style="font-weight:600; color:#eee !important; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(name)}</span>
+        </div>
+        <div style="font-size:11px; opacity:0.85; color:#eee !important;">${valueLine}</div>
+        ${extraLine}`;
+
+      const tiles = [
+        tile("🏆", "Longest turn", facts.longestTurn, (f) => {
+          const { name, color } = person(f.ownerId);
+          return nameValueHtml(name, color, formatDuration(Math.round(f.ms / 1000)));
+        }),
+        tile("⚡", "Shortest turn", facts.shortestTurn, (f) => {
+          const { name, color } = person(f.ownerId);
+          return nameValueHtml(name, color, formatDuration(Math.round(f.ms / 1000)));
+        }),
+        tile("🐌", "Slowest on average", facts.slowestAvg, (f) => {
+          const { name, color } = person(f.ownerId);
+          return nameValueHtml(name, color, `Ø ${formatDuration(Math.round(f.avgMs / 1000))}/round`);
+        }),
+        tile("⏳", "Longest wait", facts.longestWait, (f) => {
+          const { name, color } = person(f.ownerId);
+          const avgLine = `<div style="font-size:9px; opacity:0.45; margin-top:1px; color:#eee !important;">session avg ${formatDuration(Math.round(facts.avgWaitMs / 1000))}</div>`;
+          return nameValueHtml(name, color, formatDuration(Math.round(f.ms / 1000)), avgLine);
+        }),
+        tile("💨", "Quickest reaction", facts.quickestReaction, (f) => {
+          const { name, color } = person(f.ownerId);
+          return nameValueHtml(name, color, formatDuration(Math.round(f.ms / 1000)));
+        }),
+        tile("🔁", "Most reactions", facts.mostReactions, (f) => {
+          const { name, color } = person(f.ownerId);
+          return nameValueHtml(name, color, `${f.count} reaction${f.count === 1 ? "" : "s"}`);
+        }),
+      ].join("");
+
+      const hasAnyFact = facts.longestTurn || facts.shortestTurn || facts.slowestAvg
+        || facts.longestWait || facts.quickestReaction || facts.mostReactions;
+
+      return wrapCard({
+        title: "🎉 Fun Facts",
+        subtitle: `Total ${formatDuration(Math.round(sessionTotalMs(segs) / 1000))}`,
+        body: hasAnyFact ? `<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:2px;">${tiles}</div>` : "",
       });
     }
 
@@ -3040,6 +3175,7 @@
         { key: "bars", label: "📊 Bar chart — time per person" },
         { key: "players", label: "🧑 Player list — turn, gap, wait" },
         { key: "rounds", label: "📈 Round pacing — time per round" },
+        { key: "facts", label: "🎉 Fun facts — extremes for the session" },
       ];
       el.innerHTML = `
         <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
@@ -3052,8 +3188,8 @@
           const kind = node.dataset.post;
           postMenuOpen = false;
           renderPanel();
-          const content = kind === "bars" ? buildBarsContent() : kind === "players" ? buildPlayerListContent() : buildRoundPacingContent();
-          await postToChat(content, kind);
+          const builders = { bars: buildBarsContent, players: buildPlayerListContent, rounds: buildRoundPacingContent, facts: buildFunFactsContent };
+          await postToChat(builders[kind](), kind);
           toast("Posted to chat — only you can see it.");
         });
       });
@@ -3107,6 +3243,7 @@
       lastLiveOwnerByCombatant, effectiveOwner, npcAggregate, categoryTotals,
       buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
       absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats, roundPacingStats,
+      funFactsStats,
     };
   }
 })();
