@@ -667,6 +667,35 @@
     return { roundCount: rounds.size, avgMs: rounds.size ? ms / rounds.size : 0 };
   }
 
+  // The tiny aggregate record appended to the campaign log at archive time -
+  // pure arithmetic over what perCombatantStats()/sessionTotalMs()/
+  // gmRoundStats() already compute (all three passed in, not recomputed
+  // here), so this needs no new analysis logic, just a reduction into one
+  // small object. avgTurnMs is the WEIGHTED average turn length across every
+  // player (sum of credited time / sum of turn counts) - the same ratio
+  // turnWindowStats() computes per player individually (perCombatantStats()'s
+  // turnCount and turnWindowStats()'s window count are always equal for the
+  // same owner - both gate on the identical "designated, real, opening
+  // player turn" condition), just aggregated across everyone at once instead
+  // of shown per person. avgRoundMs is deliberately sessionTotalMs()/
+  // roundCount (everyone's time), not gmRoundStats()'s own GM-only avgMs -
+  // this is meant to answer "how fast did rounds go overall", the same
+  // question the round-pacing report answers per round, not "how much GM
+  // time was in an average round".
+  function campaignLogEntry(endedAt, totalMs, roundCount, perCombatantEntries) {
+    const perOwnerMs = Object.fromEntries(perCombatantEntries.map((e) => [e.id, e.totalMs]));
+    const turnMsSum = perCombatantEntries.reduce((sum, e) => sum + e.totalMs, 0);
+    const turnCountSum = perCombatantEntries.reduce((sum, e) => sum + e.turnCount, 0);
+    return {
+      endedAt,
+      totalMs,
+      roundCount,
+      perOwnerMs,
+      avgTurnMs: turnCountSum ? turnMsSum / turnCountSum : 0,
+      avgRoundMs: roundCount ? totalMs / roundCount : 0,
+    };
+  }
+
   // Buckets one set of segments' tracked time by who it belongs to - same
   // ownership rules summaryEntries() uses for the main chart (player/GM via
   // countsForGM()/effectiveOwner(), plus Team/Setup as their own buckets).
@@ -816,6 +845,16 @@
     function archivedSessionKey(id) {
       return `ctp-state-archive-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}-${id}`;
     }
+    // A separate, much longer-retained history than the archive above - one
+    // tiny record per session (see campaignLogEntry()), not the full segment
+    // array, so it can hold hundreds of entries without approaching the
+    // quota concerns the archive itself already has to manage. Different
+    // retention policy, different key, on purpose: the archive stays "last N
+    // combats, fully replayable in detail", this stays "every combat ever,
+    // numbers only".
+    function campaignLogKey() {
+      return `ctp-campaign-log-${game.world?.id ?? "default"}-${game.user?.id ?? "default"}`;
+    }
     // Throttled so a persistently-failing persist() (e.g. quota permanently
     // exceeded) surfaces once rather than spamming a toast every render tick.
     let lastStorageErrorToastAt = 0;
@@ -867,6 +906,37 @@
         notifyStorageError("Could not save an archived session - check browser storage.");
       }
     }
+    function loadCampaignLog() {
+      try {
+        const raw = JSON.parse(localStorage.getItem(campaignLogKey()) ?? "null");
+        return Array.isArray(raw?.sessions) ? raw.sessions : null;
+      } catch (e) {
+        console.warn("Combat Timer: could not load the campaign log", e);
+        loadFailed = true;
+        return null;
+      }
+    }
+    function writeCampaignLog() {
+      try {
+        localStorage.setItem(campaignLogKey(), JSON.stringify({ v: 1, sessions: campaignLog }));
+      } catch (e) {
+        console.warn("Combat Timer: could not save the campaign log", e);
+        notifyStorageError("Could not save the campaign log - check browser storage.");
+      }
+    }
+    // A generous, hardcoded safety backstop, not a user-facing setting like
+    // ui.maxArchivedSessions - each entry is a few hundred bytes at most (see
+    // campaignLogKey()), so this is insurance against unbounded growth over
+    // years of use, not a real-world concern in practice.
+    const CAMPAIGN_LOG_MAX_ENTRIES = 500;
+    // Appends one session's record immediately, the same one-off write
+    // pattern writeArchivedSession() uses - archiving a session is a one-off
+    // event, not the per-tick renderPanel() path.
+    function appendCampaignLogSession(entry) {
+      campaignLog.unshift(entry);
+      if (campaignLog.length > CAMPAIGN_LOG_MAX_ENTRIES) campaignLog.length = CAMPAIGN_LOG_MAX_ENTRIES;
+      writeCampaignLog();
+    }
     function persist() {
       if (liveDirty) {
         try {
@@ -897,6 +967,7 @@
     let segments = [];          // current session: closed segments
     let currentSegment = null;  // current session: the running segment
     let archiveManifest = [];   // [{ id, startedAt, endedAt }], newest first - small, always fully in memory
+    let campaignLog = [];       // [campaignLogEntry(...)], newest first - see campaignLogKey(), small, always fully in memory
     let viewedArchive = null;   // { id, segments } - lazily loaded snapshot of whichever archived session is selected
     let panelVisible = true;
     let loadFailed = false;     // set on any load error; toasted once buildPanel() exists
@@ -946,6 +1017,8 @@
         manifestDirty = true;
       }
     }
+    const loadedCampaignLog = loadCampaignLog();
+    if (loadedCampaignLog) campaignLog = loadedCampaignLog;
 
     function uid() {
       return crypto.randomUUID
@@ -1126,7 +1199,9 @@
     function archiveSessionIfNeeded() {
       closeSegment();
       if (!segments.length) return;
-      addArchivedSession(segments[0].start, Date.now(), segments);
+      const endedAt = Date.now();
+      addArchivedSession(segments[0].start, endedAt, segments);
+      appendCampaignLogSession(campaignLogEntry(endedAt, sessionTotalMs(segments), gmRoundStats(segments).roundCount, perCombatantStats(segments)));
       segments = [];
       currentSegment = null;
       liveDirty = true; // segments/currentSegment just reset to empty
@@ -1623,25 +1698,34 @@
     }
 
     // "+N more" merged color for a bucketTimeByOwner() breakdown with more
-    // contributors than capEntities()'s cap. Unlike buildPlayerBarRows()/
-    // buildGmBarSegments() (shades of ONE owner's own color), these buckets
-    // are genuinely different people/categories with their own distinct
-    // colors already - so the merged slice gets its own fixed,
-    // owner-independent grey instead of a shade derived from any one of
-    // them. Shared by buildRoundPacingContent() and
-    // buildRecentComparisonContent() - the two reports that decompose a bar
-    // by bucketTimeByOwner() key rather than by one owner's own entities.
+    // contributors than capEntities()'s cap - also reused as the "Other"
+    // bucket's own color in the campaign trend report (see
+    // campaignEntryByKey() below), since that's the same idea: several
+    // different, not-individually-broken-out things folded into one neutral
+    // slice. Unlike buildPlayerBarRows()/buildGmBarSegments() (shades of ONE
+    // owner's own color), these buckets are genuinely different
+    // people/categories with their own distinct colors already - so the
+    // merged slice gets its own fixed, owner-independent grey instead of a
+    // shade derived from any one of them. Shared by buildRoundPacingContent(),
+    // buildRecentComparisonContent(), and buildCampaignTrendContent() - the
+    // three reports that decompose a bar by bucketTimeByOwner()-shaped key
+    // rather than by one owner's own entities.
     const OWNER_MERGED_COLOR = "#54545f";
 
     // Resolves a bucketTimeByOwner() key into a display name/color - shared
-    // by buildRoundPacingContent() and buildRecentComparisonContent(). This
-    // is where those keys (ownerId, or the "gm"/"team"/"setup" sentinels)
-    // become display info via game.users, the same resolution
-    // summaryEntries() does for perCombatantStats()/gmTotalStats().
+    // by buildRoundPacingContent(), buildRecentComparisonContent(), and
+    // buildCampaignTrendContent(). This is where those keys (ownerId, or the
+    // "gm"/"team"/"setup"/"other" sentinels) become display info via
+    // game.users, the same resolution summaryEntries() does for
+    // perCombatantStats()/gmTotalStats(). "other" is campaign-trend-only -
+    // the campaign log only records perOwnerMs (see campaignLogEntry()), so
+    // a logged session's GM/Team/Setup time can't be told apart the way a
+    // live session's can; it all folds into one "Other" slice instead.
     function ownerKeyDisplay(key) {
       if (key === "team") return { name: "Team", color: TEAM_COLOR };
       if (key === "setup") return { name: "Setup", color: SETUP_COLOR };
       if (key === "gm") return { name: "GM", color: getCombatantColor(null) };
+      if (key === "other") return { name: "Other", color: OWNER_MERGED_COLOR };
       return { name: ownerName(key), color: getCombatantColor(key) };
     }
 
@@ -1928,6 +2012,66 @@
       });
     }
 
+    // Turns a session's totalMs + perOwnerMs (the campaign log's own tiny
+    // shape - see campaignLogEntry() - also used for "Tonight", reduced down
+    // to the exact same shape via perCombatantStats(), so every row in
+    // buildCampaignTrendContent() renders identically regardless of whether
+    // it came from the log or the live session) into a bucketTimeByOwner()-
+    // shaped Map ownerBucketBarRow() can render directly. Whatever of
+    // totalMs isn't accounted for by perOwnerMs (GM/Team/Setup time - the
+    // log doesn't keep those separate, to stay tiny) becomes one "Other"
+    // bucket instead of vanishing from the bar.
+    function campaignEntryByKey(totalMs, perOwnerMs) {
+      const byKey = new Map(Object.entries(perOwnerMs));
+      const playerMs = [...byKey.values()].reduce((sum, ms) => sum + ms, 0);
+      const otherMs = Math.max(0, totalMs - playerMs);
+      if (otherMs > 0) byKey.set("other", otherMs);
+      return byKey;
+    }
+
+    // One row per session - "Tonight" (the live session, same as
+    // buildRecentComparisonContent()) plus the n-1 most recent campaign-log
+    // entries - sized relative to the longest shown. Unlike
+    // buildRecentComparisonContent(), the "vs. average" headline is measured
+    // against the ENTIRE campaign log, not just the displayed window -
+    // "campaign average" means the whole campaign even when only a recent
+    // slice of it is drawn as bars, which is the entire reason this report
+    // exists on top of Recent Combats' own (archive-bounded) comparison.
+    function buildCampaignTrendContent(n) {
+      const liveSegs = currentSegment ? [...segments, currentSegment] : segments;
+      const tonight = {
+        label: "Tonight",
+        totalMs: sessionTotalMs(liveSegs),
+        perOwnerMs: Object.fromEntries(perCombatantStats(liveSegs).map((e) => [e.id, e.totalMs])),
+      };
+      // formatArchiveLabel(e.endedAt), not startedAt like the archive list's
+      // own rows - the campaign log deliberately doesn't keep startedAt (see
+      // campaignLogEntry()'s minimal shape), so this is the only timestamp
+      // a logged entry has.
+      const logged = campaignLog.slice(0, n - 1).map((e) => ({ label: formatArchiveLabel(e.endedAt), totalMs: e.totalMs, perOwnerMs: e.perOwnerMs }));
+      const entries = [tonight, ...logged];
+      const max = Math.max(1, ...entries.map((e) => e.totalMs));
+
+      const rows = entries.map((e) => {
+        const pctOfMax = Math.max(4, Math.round((e.totalMs / max) * 100));
+        return ownerBucketBarRow(escapeHtml(e.label), e.totalMs, campaignEntryByKey(e.totalMs, e.perOwnerMs), pctOfMax);
+      }).join("");
+
+      let headline = "";
+      if (campaignLog.length) {
+        const campaignAvgMs = campaignLog.reduce((sum, e) => sum + e.totalMs, 0) / campaignLog.length;
+        const diffPct = campaignAvgMs > 0 ? Math.round(((tonight.totalMs - campaignAvgMs) / campaignAvgMs) * 100) : 0;
+        const arrow = diffPct > 0 ? "▲" : diffPct < 0 ? "▼" : "▬";
+        headline = `<div style="font-size:10px; opacity:0.6; margin-top:6px; color:#eee !important;">Tonight ${arrow} ${Math.abs(diffPct)}% vs. campaign avg of ${campaignLog.length} session${campaignLog.length === 1 ? "" : "s"}</div>`;
+      }
+
+      return wrapCard({
+        title: "🏕️ Campaign Trend",
+        subtitle: `${entries.length} of ${campaignLog.length + 1} sessions`,
+        body: rows + headline,
+      });
+    }
+
     function buildPlayerListContent() {
       const segs = allSegments();
       const gaps = betweenTurnStats(segs);
@@ -2202,7 +2346,7 @@
     let openCatSegId = null;            // which segment has its category picker open
     let menuOpen = false;               // the ⋯ overflow menu
     let postMenuOpen = false;           // the "Post report" dropdown
-    let recentComparePicking = false;   // post-menu is showing the "how many sessions" picker instead of the report list
+    let postMenuPicking = null;         // null | "recent" | "campaign" - which window picker the post-menu is showing instead of the report list
     let archivePickerOpen = false;      // the "Archived" session list
     let settingsPickerOpen = false;     // the tracking-thresholds settings section
     let importUndo = null;              // one-level undo snapshot taken right before an import
@@ -3422,37 +3566,44 @@
       });
     }
 
-    // The "Recent combats" report needs a second step (how many sessions to
-    // compare) before it can post, unlike every other report which posts
-    // straight from the main list - see renderRecentComparePicker() below.
+    // "Recent combats" and "Campaign trend" both need a second step (how
+    // many sessions to include) before they can post, unlike every other
+    // report which posts straight from the main list - postMenuPicking
+    // names which one's window picker the post-menu is currently showing
+    // instead of the report list (null when it's showing the normal list).
     // Only fixed window sizes STRICTLY LESS than what's actually reachable
-    // are offered (archiveManifest.length archived + "Tonight"), with "all"
-    // always covering the rest - e.g. 8 archived + tonight = 9 reachable ->
-    // offer {2, 5, all}, never "10" (unreachable) or a redundant "9" AND
-    // "all" both meaning the same thing.
-    function reachableCompareWindows() {
-      const total = archiveManifest.length + 1;
-      return { total, windows: [2, 5, 10].filter((n) => n < total) };
+    // are offered, with "all" always covering the rest - e.g. 8 archived +
+    // tonight = 9 reachable -> offer {2, 5, all}, never "10" (unreachable)
+    // or a redundant "9" AND "all" both meaning the same thing.
+    function reachableCompareWindows(total, candidates) {
+      return { total, windows: candidates.filter((n) => n < total) };
     }
 
-    function renderRecentComparePicker(el) {
-      const { total, windows } = reachableCompareWindows();
+    // Renders one of the two window pickers into the post-menu section -
+    // `total`/`candidates` set the reachable options (see
+    // reachableCompareWindows()), `hint` is the small caption underneath,
+    // and `onPick(n)` builds+posts the chosen report. Shared by "Recent
+    // combats" (archiveManifest-bounded) and "Campaign trend" (campaignLog-
+    // bounded, reaching much further back) - same picker UI either way, just
+    // pointed at different data and window sizes.
+    function renderWindowPicker(el, { total, candidates, hint, onPick }) {
+      const { windows } = reachableCompareWindows(total, candidates);
       const options = [...windows, total]; // "all" always included, as the literal reachable total
       el.innerHTML = `
         <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
           ${options.map((n) => `
-            <div data-compare-window="${n}" data-hover style="cursor:pointer; padding:6px 8px; font-size:11px; text-align:center;">
+            <div data-window="${n}" data-hover style="cursor:pointer; padding:6px 8px; font-size:11px; text-align:center;">
               ${n === total ? `All (${total})` : `Last ${n}`}
             </div>`).join("")}
         </div>
-        <div style="font-size:10px; opacity:0.45; margin:4px 2px 0;">Tonight plus your most recently archived sessions.</div>`;
-      el.querySelectorAll("[data-compare-window]").forEach((node) => {
+        <div style="font-size:10px; opacity:0.45; margin:4px 2px 0;">${hint}</div>`;
+      el.querySelectorAll("[data-window]").forEach((node) => {
         node.addEventListener("click", async () => {
-          const n = Number(node.dataset.compareWindow);
+          const n = Number(node.dataset.window);
           postMenuOpen = false;
-          recentComparePicking = false;
+          postMenuPicking = null;
           renderPanel();
-          await postToChat(buildRecentComparisonContent(n), "recent");
+          await onPick(n);
           toast("Posted to chat — only you can see it.");
         });
       });
@@ -3462,14 +3613,29 @@
       const el = panel.querySelector("#ctp-post-menu");
       el.style.display = postMenuOpen ? "block" : "none";
       if (!postMenuOpen) {
-        recentComparePicking = false; // stale sub-view never lingers into the next time the menu opens
+        postMenuPicking = null; // stale sub-view never lingers into the next time the menu opens
         return;
       }
-      if (recentComparePicking) {
-        renderRecentComparePicker(el);
+      const canCompareRecent = archiveManifest.length > 0;
+      const canCompareCampaign = campaignLog.length > 0;
+      if (postMenuPicking === "recent") {
+        renderWindowPicker(el, {
+          total: archiveManifest.length + 1,
+          candidates: [2, 5, 10],
+          hint: "Tonight plus your most recently archived sessions.",
+          onPick: (n) => postToChat(buildRecentComparisonContent(n), "recent"),
+        });
         return;
       }
-      const canCompare = archiveManifest.length > 0;
+      if (postMenuPicking === "campaign") {
+        renderWindowPicker(el, {
+          total: campaignLog.length + 1,
+          candidates: [10, 25, 50],
+          hint: "Tonight plus your logged campaign history.",
+          onPick: (n) => postToChat(buildCampaignTrendContent(n), "campaign"),
+        });
+        return;
+      }
       const options = [
         { key: "bars", label: "📊 Bar chart — time per person" },
         { key: "players", label: "🧑 Player list — turn, gap, wait" },
@@ -3477,7 +3643,8 @@
         { key: "facts", label: "🎉 Fun facts — extremes for the session" },
         { key: "gmoverhead", label: "🎲 GM overhead — monsters, setup, manual" },
         { key: "pauses", label: "⏸️ Pauses — total, count, longest" },
-        { key: "recent", label: "🔀 Recent combats — compare sessions", disabled: !canCompare, hint: canCompare ? null : "needs an archived session" },
+        { key: "recent", label: "🔀 Recent combats — compare sessions", disabled: !canCompareRecent, hint: canCompareRecent ? null : "needs an archived session" },
+        { key: "campaign", label: "🏕️ Campaign trend — vs. campaign average", disabled: !canCompareCampaign, hint: canCompareCampaign ? null : "needs a logged session" },
       ];
       el.innerHTML = `
         <div style="border:1px solid ${THEME.border}; border-radius:6px; overflow:hidden;">
@@ -3493,9 +3660,9 @@
       el.querySelectorAll("[data-post]").forEach((node) => {
         node.addEventListener("click", async () => {
           const kind = node.dataset.post;
-          if (kind === "recent") {
-            if (!canCompare) return;
-            recentComparePicking = true;
+          if (kind === "recent" || kind === "campaign") {
+            if ((kind === "recent" && !canCompareRecent) || (kind === "campaign" && !canCompareCampaign)) return;
+            postMenuPicking = kind;
             renderPanel();
             return;
           }
@@ -3560,6 +3727,7 @@
       buildTurnSlots, ownTurnSlotsByOwner, betweenTurnStats, turnWindowStats,
       absoluteWaitStats, sessionTotalMs, countsForGM, gmTotalStats, gmRoundStats, roundPacingStats,
       funFactsStats, gmOverheadStats, bucketTimeByOwner, sessionCompareStats, pauseSummaryStats,
+      campaignLogEntry,
     };
   }
 })();
